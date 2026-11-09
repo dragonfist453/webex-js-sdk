@@ -174,6 +174,28 @@ describe('Orpheus-backed Meetings reachability', () => {
     });
   });
 
+  it('routes Orpheus public discovery effects through authenticated Meetings discovery', async () => {
+    await reachability.gatherReachability('registration');
+    webex.request.resetHistory();
+    const body = {trigger: 'startup', 'supported-options': {'report-version': 1}};
+
+    await options.fetchImpl('https://app.example.test/calliope/api/discovery/v1/publicClusters', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
+
+    assert.calledOnceWithExactly(webex.request, {
+      api: 'calliopeDiscovery',
+      resource: 'clusters',
+      method: 'POST',
+      headers: {},
+      body,
+      signal: undefined,
+      shouldRefreshAccessToken: false,
+      timeout: 5000,
+    });
+  });
+
   it('preserves real preferences, cookie, IP-version and transcoding semantics without losing clusters', async () => {
     await reachability.gatherReachability('registration');
     const result = await reachability.getClientMediaPreferences(false, undefined);

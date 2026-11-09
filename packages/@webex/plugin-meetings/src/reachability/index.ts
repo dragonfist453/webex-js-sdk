@@ -142,7 +142,7 @@ export default class Reachability extends EventsScope {
     const request = () =>
       this.webex.request({
         api: 'calliopeDiscovery',
-        resource,
+        resource: 'clusters',
         method: init.method ?? 'POST',
         headers: Object.fromEntries(new Headers(init.headers).entries()),
         body,

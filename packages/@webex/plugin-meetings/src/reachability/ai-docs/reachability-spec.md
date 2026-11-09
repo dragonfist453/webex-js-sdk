@@ -73,7 +73,7 @@ Existing protocol/NAT/report types and URL utilities remain. The old per-UDP-URL
 
 | ID | WHAT | WHY | Evidence / tests |
 | --- | --- | --- | --- |
-| `REACHABILITY-R-001` | Delegate normal discovery to Orpheus and route its original body through `webex.request`/interceptors. | Preserve host authentication/routing without competing discovery engines. | `index.ts#fetchDiscovery`; `orpheus.ts` |
+| `REACHABILITY-R-001` | Delegate normal discovery to Orpheus and route its original body through authenticated Webex `clusters` discovery and existing interceptors, including when Orpheus emits a logical `publicClusters` effect. | Preserve the working authenticated Meetings route rather than accidentally switching to public discovery. | `index.ts#fetchDiscovery`; `orpheus.ts` |
 | `REACHABILITY-R-002` | Let Orpheus execute UDP/TCP/xTLS; apply disabled transport policy without mutating service responses. | Existing config stays authoritative; disabled means untested, not failed. | `fetchDiscovery`; `orpheus.ts` |
 | `REACHABILITY-R-003` | Preserve disabled rejection, skip/failure sentinel, void completion and bounded registration readiness. | The full collection deadline must not hold registration. | `gatherReachability`; `orpheus.ts` |
 | `REACHABILITY-R-004` | Delegate probe cleanup to Orpheus and retire host generations/listeners/timers idempotently. | Late callbacks or stopped initialization must not restart work or emit false completion. | `stopReachability`, `shutdown`; `orpheus.ts` |

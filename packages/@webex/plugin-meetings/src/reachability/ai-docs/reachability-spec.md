@@ -77,7 +77,7 @@ Existing protocol/NAT/report types and URL utilities remain. The old per-UDP-URL
 | `REACHABILITY-R-002` | Let Orpheus execute UDP/TCP/xTLS; apply disabled transport policy without mutating service responses. | Existing config stays authoritative; disabled means untested, not failed. | `fetchDiscovery`; `orpheus.ts` |
 | `REACHABILITY-R-003` | Preserve disabled rejection, skip/failure sentinel, void completion and bounded registration readiness. | The full collection deadline must not hold registration. | `gatherReachability`; `orpheus.ts` |
 | `REACHABILITY-R-004` | Delegate probe cleanup to Orpheus and retire host generations/listeners/timers idempotently. | Late callbacks or stopped initialization must not restart work or emit false completion. | `stopReachability`, `shutdown`; `orpheus.ts` |
-| `REACHABILITY-R-005` | Preserve the full cluster matrix, cookie, IP version, trigger, report placement and metric outcomes, with live-cache fallback. | Storage failure/conversion must not discard connectivity evidence. | Report/cache methods; retained `index.ts` contract tests and `orpheus.ts` |
+| `REACHABILITY-R-005` | Preserve the full discovered cluster matrix and each measured probe in partial results while slower transports remain pending; leave untested outcomes distinct from failure. Preserve cookie, IP version, trigger, report placement and metric outcomes, with live-cache fallback. | Slow TCP/TLS must not starve later UDP probes or hide measured connectivity; storage/conversion must not discard that evidence. | Pinned Orpheus scheduler/report regressions; report/cache methods; retained `index.ts` contract tests and `orpheus.ts` |
 
 ## Data flow
 

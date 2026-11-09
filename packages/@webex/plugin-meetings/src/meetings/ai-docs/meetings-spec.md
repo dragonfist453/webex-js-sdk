@@ -236,6 +236,8 @@ Registration progress, meeting collection entries, sync state, and listener hand
 
 ## Concurrency & Reactive Flow
 
+- Orpheus reachability integration: `unregister()` stops current reachability probes and scheduled refresh before waiting for pending registration or removing device/Mercury state. This releases the reachability readiness wait without disposing the facade permanently, so a later registration can start a fresh run. Evidence: `src/meetings/index.ts`, `test/unit/spec/meetings/index.js` (`#unregister`).
+
 - Registration steps run through one `Promise.all` aggregate, with Mercury connection chained behind device registration. `executeRegistrationStep()` sets a flag after its callback resolves. Site-preference fetching and the registration reachability callback absorb their own failures and therefore still set their flags; a rejection from another step propagates without clearing flags already set. Unregistration removes the Mercury/device registration owned by the plugin; individual meeting synchronization requests remain separate returned promises rather than silently changing registration success.
 
 ## State Machine

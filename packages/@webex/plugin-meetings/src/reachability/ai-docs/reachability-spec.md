@@ -1,261 +1,119 @@
 <!-- sdd-generated-metadata
 doc_kind: module-spec
 generated_from: module-spec@0.2.2
-generator_plugin: repo-annotation@1.0.5+codex.20260818094939
 generated_by: codex
 approved_by: repository user
-updated_at: 2026-08-22T15:21:29Z
-validation_status: pass-with-warnings
+updated_at: 2026-11-09
+validation_status: not-run
 -->
 # REACHABILITY — SPEC
 
-> Start here → root [`AGENTS.md`](../../../AGENTS.md) · router [`SPEC_INDEX.md`](../../../ai-docs/SPEC_INDEX.md) · system [`ARCHITECTURE.md`](../../../ai-docs/ARCHITECTURE.md). This is the canonical source-local spec for `src/reachability/`.
+> Root [`AGENTS.md`](../../../AGENTS.md) · [`CONTRACTS.md`](../../../ai-docs/CONTRACTS.md) · [`RULES.md`](../../../ai-docs/RULES.md).
 
-## Metadata
+## Scope and provenance
 
-| Field | Value |
-|---|---|
-| Module id | `reachability` |
-| Source path(s) | `src/reachability/` |
-| Parent spec | — |
-| Doc kind | Module spec |
-| Coverage score | 93% assessed 2026-08-22; 13/14 mandatory fields present; all critical and Important fields present; one noncritical polish gap remains; pending independent validation of the participant-role repair |
-| Generated from | `module-spec` @ SDLC template library `0.2.2` |
-| generated_by / approved_by / updated_at | codex / repository user / 2026-08-22T15:21:29Z |
-| Validation status | pass-with-warnings |
+Module `src/reachability/` remains **Partial** in the manifest. Source and mirrored tests are authoritative. The repository user approved replacing the legacy browser reachability engine with Orpheus, preserving the Meetings consumer contract and validating an unchanged web client against the built SDK. This document reconciles that approved change; independent spec validation has not run.
 
-## Evidence Rules
+## Purpose and ownership
 
-Requirements cite current implementation and mirrored unit-test paths. Current code wins over retained prose when they conflict; commit and PR history are excluded by repository-owner decision. Missing test evidence is stated as a gap rather than inferred.
+`Reachability` is the compatibility controller exposed by `webex.meetings.getReachability()`. Orpheus owns discovery-driven planning, UDP/TCP/xTLS probes, aggregation, refresh and cancellation. The controller owns Webex routing/credentials, protocol policy, compatibility storage/report formats, registration readiness, event scope and metrics submission.
 
-## Source Material Register
+The legacy `ClusterReachability` and `ReachabilityPeerConnection` engines are removed. No application-side instance replacement, Orpheus alias, loader or diagnostic UI is needed.
 
-| Source material | Scope | Decision | Detail location or disposition |
-|---|---|---|---|
-| No routed legacy module spec | overview / API / behavior / tests | none; generated from current cluster/probe/request code and tests |
-| Current source and mirrored tests | implementation / tests | verified | requirements, flows, failures, and test strategy below |
+## Files and dependencies
 
-## Overview
+| File | Responsibility |
+| --- | --- |
+| `index.ts` | Lazy composition, Webex HTTP bridge, compatibility methods and metrics |
+| `orpheus-loader.ts`, `orpheus.types.ts` | Lazy packaged runtime import and typed adapter boundary |
+| `orpheus/js/orpheus-client.d.ts` | Declaration for the build-staged browser entry |
+| `reachability.types.ts` | Existing transport, report and metric vocabulary |
+| `request.ts` | Retained advanced direct discovery and dormant SDP request helpers |
+| `util.ts` | Existing protocol-policy and exported URL utilities |
+| `scripts/orpheus-reachability-source.json` | Reviewed source repository and exact revision |
+| `scripts/build-orpheus-reachability.cjs` | Build and stage browser entry, main-thread ICE executor, Worker and Wasm together |
 
-`src/reachability/` contains 6 direct source/reference file(s) and has 4 mirrored unit-test file(s). This spec separates its public operations, runtime data movement, component ownership, state applicability, and verification boundary.
+External requirements: Webex host request/credential/service abstractions, browser Worker/WebRTC/WebAssembly APIs, and pinned Orpheus source. Constructing/importing Meetings does not start browser work.
 
-## Purpose / Responsibility
+## Public contracts
 
-Discovers media clusters, probes protocol reachability with peer connections, determines NAT characteristics, and reports results.
+| Surface | Behavior |
+| --- | --- |
+| `gatherReachability(trigger)` | Disabled configuration rejects. Missing browser capabilities or caught runtime failure returns `{}`. Successful completion resolves `undefined`. Concurrent callers share work. Registration readiness is released after a 3-second window while a full gather may continue. |
+| `gatherReachabilityFallback()` | Stops prior work and requests fresh SDK-owned discovery with fallback context; absorbs its documented internal failures. |
+| `stopReachability()` | Stops probes/refresh, clears readiness timers, settles waiting callers and emits stopped for an active run. Retired generations cannot announce completion. |
+| `shutdown()` | Idempotently stops the runtime and removes the page listener; also called on `pagehide`. |
+| `getClusters(trigger, previousReport?, isRetry?)` | Retained direct discovery helper with one retry and cookie/option caching. Normal gathering does not reconstruct the Orpheus-owned request through this helper. |
+| `getReachabilityResults()` | Complete cached cluster matrix in backend string-valued format, or undefined without results. |
+| `getReachabilityReport()`, `getJoinCookie()` | Negotiated report version, minimum-cluster option, duration and current cookie. |
+| `getClientMediaPreferences(isMultistream, ipver?)` | Real SDK preferences with existing IP-version and inverse-transcoding semantics. Version-one reports belong here; version-zero reports remain on ROAP. |
+| `getReachabilityReportToAttachToRoap()` | Results for version zero; undefined for version one. |
+| Reachability query methods | Preserve public/video-mesh distinctions. Fully unreachable requires every transport to have measured failure and no measured success; untested is not failed. |
+| `getReachabilityMetrics()` | Preserve existing counters and NAT field. Orpheus currently supplies no symmetric-NAT classification, so NAT type remains unknown. |
+| `getDiagnostics()`, `getLogLevel()`, `setLogLevel(level)` | Additive sanitized diagnostics and verbosity. Default warn through the normal Webex logger; no console bypass. |
 
-## Stack
+Existing protocol/NAT/report types and URL utilities remain. The old per-UDP-URL toggle does not select a legacy engine: Orpheus isolates its browser probes itself.
 
-TypeScript/JavaScript in the Node 22.14 Yarn workspace; Webex core/plugin abstractions and Mocha/Sinon/`@webex/test-helper-chai` tests. Build target: `yarn workspace @webex/plugin-meetings build:src`.
+## Events and state
 
-## Folder / Package Structure
+- `reachability:firstResultAvailable` retains `{protocol}` and the existing event scope.
+- `reachability:done` follows projection of the completed report into the compatibility cache, not early registration readiness.
+- `reachability:stopped` is emitted for an active gather stopped by the consumer.
+- Stop/disposal retire the local generation, settle callers and suppress late completion.
+- Live reports/cookies take precedence over optional persisted cache data. Cache failures do not discard measured results.
 
-```text
-src/reachability/
-├── clusterReachability.ts — clusterReachability implementation responsibility
-├── index.ts — module facade/controller or primary exports
-├── reachability.types.ts — module type declarations
-├── reachabilityPeerConnection.ts — reachabilityPeerConnection implementation responsibility
-├── request.ts — HTTP request boundary
-├── util.ts — normalization/helper functions
-└── ai-docs/reachability-spec.md — canonical module specification
-```
+## ADDED Requirements
 
-## Key Files (source of truth)
+| ID | WHAT | WHY | Evidence / tests |
+| --- | --- | --- | --- |
+| `REACHABILITY-R-006` | Build the exact pinned Orpheus revision and package its browser entry, main-thread ICE executor, Worker and Wasm together. Never commit generated output or require a sibling path at runtime. | Consumer builds must not depend on the prototype's frontend alias. | Build script/source manifest; `scripts/build-orpheus-reachability.test.cjs` |
+| `REACHABILITY-R-007` | Lazy-load browser work, redact failures and preserve configurable normal logging thresholds with default warn. | Avoid browser-only import errors, production flooding and credential disclosure. | Loader/controller; `test/unit/spec/reachability/orpheus.ts` |
 
-| File | Holds |
-|---|---|
-| `src/reachability/clusterReachability.ts` | clusterReachability implementation responsibility |
-| `src/reachability/index.ts` | module facade/controller or primary exports |
-| `src/reachability/reachability.types.ts` | module type declarations |
-| `src/reachability/reachabilityPeerConnection.ts` | reachabilityPeerConnection implementation responsibility |
-| `src/reachability/request.ts` | HTTP request boundary |
-| `src/reachability/util.ts` | normalization/helper functions |
-| `test/unit/spec/reachability/clusterReachability.ts` and 3 sibling test file(s) | mirrored characterization/unit coverage |
+## MODIFIED Requirements
 
-## Public Surface
+| ID | WHAT | WHY | Evidence / tests |
+| --- | --- | --- | --- |
+| `REACHABILITY-R-001` | Delegate normal discovery to Orpheus and route its original body through `webex.request`/interceptors. | Preserve host authentication/routing without competing discovery engines. | `index.ts#fetchDiscovery`; `orpheus.ts` |
+| `REACHABILITY-R-002` | Let Orpheus execute UDP/TCP/xTLS; apply disabled transport policy without mutating service responses. | Existing config stays authoritative; disabled means untested, not failed. | `fetchDiscovery`; `orpheus.ts` |
+| `REACHABILITY-R-003` | Preserve disabled rejection, skip/failure sentinel, void completion and bounded registration readiness. | The full collection deadline must not hold registration. | `gatherReachability`; `orpheus.ts` |
+| `REACHABILITY-R-004` | Delegate probe cleanup to Orpheus and retire host generations/listeners/timers idempotently. | Late callbacks or stopped initialization must not restart work or emit false completion. | `stopReachability`, `shutdown`; `orpheus.ts` |
+| `REACHABILITY-R-005` | Preserve the full cluster matrix, cookie, IP version, trigger, report placement and metric outcomes, with live-cache fallback. | Storage failure/conversion must not discard connectivity evidence. | Report/cache methods; retained `index.ts` contract tests and `orpheus.ts` |
 
-| Contract ID | Type | Surface | Purpose | Compatibility / deprecation | Schema / detail link | Root index |
-|---|---|---|---|---|---|---|
-| `reachability.1` | SDK / remote | `Reachability.getClusters()` and `gatherReachability()` | Fetch cluster discovery data, cache the join cookie, and start a configured reachability run. | Disabled reachability rejects before the catch boundary; missing WebRTC capability or caught discovery/probe failure returns `{}`; a started successful run resolves its defer promise with `undefined` after storing results. | `src/reachability/index.ts`, `src/reachability/request.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.2` | SDK / async | `ClusterReachability.getResult()`, `start()`, `abort()` and `ReachabilityPeerConnection.getResult()`, `start()`, `abort()` | Run and settle per-cluster/per-protocol WebRTC probes with owned timers and peer connections. | Preserve the `udp`, `tcp`, and `xtls` protocol names and one-settlement cleanup. | `src/reachability/clusterReachability.ts`, `src/reachability/reachabilityPeerConnection.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.3` | SDK / lifecycle | `gatherReachabilityFallback()` and `stopReachability()` | Restart with fallback discovery when the minimum cluster target is missed, or abort an active run. | Both paths absorb their documented internal failures; stop emits `reachability:stopped` only for an active timer. | `src/reachability/index.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.4` | SDK / query | `isSubnetReachable()`, `isAnyPublicClusterReachable()`, `isWebexMediaBackendUnreachable()`, and `isAnyClusterReachableViaProtocol()` | Answer media-selection questions from the latest in-memory cluster results. | Preserve boolean/null semantics and current public/video-mesh distinctions. | `src/reachability/index.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.5` | SDK / report | `getJoinCookie()`, `getReachabilityReport()`, `getReachabilityMetrics()`, `getReachabilityResults()`, `getClientMediaPreferences()`, and `getReachabilityReportToAttachToRoap()` | Read cached/in-memory results and format local metrics, media preferences, or ROAP attachment data. | These methods construct/return data; they do not submit a reachability report to the service. | `src/reachability/index.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.6` | exported utilities | `resolveReachabilityProtocols()`, `isReachabilityEnabled()`, `convertStunUrlToTurn()`, and `convertStunUrlToTurnTls()` | Resolve configured protocol sets and transform validated STUN URLs for probe setup. | Invalid STUN input throws; preserve `xtls` and URL conversion behavior. | `src/reachability/util.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.7` | exported events/types | `Events`, `ResultEventData`, `ClientMediaIpsUpdatedEventData`, `NatTypeUpdatedEventData`, `Protocol`, `ResolvedReachabilityProtocols`, `ReachabilityProtocolConfig`, `EnableReachabilityChecksConfig`, `ReachabilityPeerConnectionEvents`, `TransportResult`, `NatType`, `ClusterReachabilityResult`, `ReachabilityMetrics`, `TransportResultForBackend`, `ReachabilityResultForBackend`, `ReachabilityResultsForBackend`, `ReachabilityResults`, `ReachabilityReportV0`, `ReachabilityReportV1`, `ClientMediaPreferences`, `GetClustersTrigger`, `ClusterNode`, and `ClusterList` | Share the exact probe/result vocabulary with Meetings, metrics, and ROAP code. | Add fields compatibly and preserve raw result/protocol/NAT values. | `src/reachability/clusterReachability.ts`, `src/reachability/reachability.types.ts`, `src/reachability/request.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-| `reachability.8` | dormant request helper | `ReachabilityRequest.remoteSDPForClusters()` | POST local SDP offers to the reachability resource and return remote SDP bodies when called directly. | No current package code invokes this exported helper; do not present it as part of `gatherReachability()`. | `src/reachability/request.ts` | [CONTRACTS](../../../ai-docs/CONTRACTS.md) |
-
-### Emitted events
-
-Current source emits these observable literals from the `Reachability` controller. Preserve literal values and the current terminal/progress timing.
-
-| Event literal | Constant / expression | Emission evidence |
-|---|---|---|
-| `reachability:done` | inline literal | `src/reachability/index.ts` |
-| `reachability:firstResultAvailable` | inline literal | `src/reachability/index.ts` |
-| `reachability:stopped` | inline literal | `src/reachability/index.ts` |
-
-Compatibility notes:
-- Prefer additive options and payload fields. Preserve method/event names, rejection semantics, and cleanup timing; route public changes through `src/index.ts` or the documented owning object.
-
-## Requires (dependencies)
-
-Webex reachability services, browser RTCPeerConnection, STUN/TURN candidates, timers, and metrics/request access.
-
-## Requirements
-
-| ID | WHAT | WHY | Source Evidence | Test / Example Evidence | Assumptions / Gaps | Confidence |
-|---|---|---|---|---|---|---|
-| `REACHABILITY-R-001` | fetch and normalize candidate clusters. | Discovers media clusters, probes protocol reachability with peer connections, determines NAT characteristics, and reports results. | `src/reachability/index.ts` | `test/unit/spec/reachability/index.ts` | none | PRESENT |
-| `REACHABILITY-R-002` | Run the `udp`, `tcp`, and `xtls` reachability probes used by code and metric keys. | Callers and telemetry consumers need the exact wire/field name rather than an ambiguous prose-only TLS label. | `src/reachability/index.ts`, `src/reachability/clusterReachability.ts`, `src/reachability/reachability.types.ts` | `test/unit/spec/reachability/index.ts` | none | PRESENT |
-| `REACHABILITY-R-003` | `gatherReachability()` throws from its `async` body when reachability is disabled before entering its `try`, so the returned promise rejects; it returns `{}` when WebRTC is unavailable or when discovery/probe setup fails inside the `try`. A started successful run returns the defer promise, which resolves with `undefined` after results are stored. `getClusters()` retries once and can reject its direct caller on the second failure; fallback catches and logs its own failures. | Callers must distinguish the disabled-config rejection, empty-object skip/failure sentinel, and successful void settlement instead of treating every gather outcome as `{}` or a rejection. | `src/reachability/index.ts`, `src/reachability/clusterReachability.ts`, `src/reachability/reachabilityPeerConnection.ts` | `test/unit/spec/reachability/index.ts`, `test/unit/spec/reachability/clusterReachability.ts` | none | PRESENT |
-| `REACHABILITY-R-004` | Each cluster/protocol probe settles once, closes its peer connection/timer, and contributes an explicit reachable/unreachable result. | ICE events and timeouts race; deterministic cleanup and aggregation prevent false success and leaks. | `src/reachability/clusterReachability.ts`, `src/reachability/reachabilityPeerConnection.ts` | `test/unit/spec/reachability/clusterReachability.ts` | none | PRESENT |
-| `REACHABILITY-R-005` | The aggregate report preserves IP version, NAT/protocol/cluster outcomes, previous-report context, and trigger. | The backend and media selection need comparable current results rather than a single boolean. | `src/reachability/index.ts`, `src/reachability/reachability.types.ts`, `src/reachability/request.ts` | `test/unit/spec/reachability/index.ts`, `test/unit/spec/reachability/request.js` | none | PRESENT |
-
-## Design Overview
-
-`Reachability` fetches media clusters with `request.ts`, builds a `ClusterReachability` aggregate per cluster, and runs UDP/TCP/`xtls` probes through `ReachabilityPeerConnection`; each probe owns and closes its peer connection and timeout.
-
-## Data Flow
+## Data flow
 
 ```mermaid
 flowchart LR
-  Caller[Meetings registration / diagnostics] --> Reach[index.ts]
-  Reach --> Request[request.ts cluster discovery]
-  Request --> Service[reachability service]
-  Reach --> Cluster[clusterReachability.ts]
-  Cluster --> Probe[reachabilityPeerConnection.ts]
-  Probe --> ICE[WebRTC ICE candidate gathering]
-  Probe --> Cluster
-  Cluster --> Reach
-  Reach --> Local[local report / metrics / ROAP attachment]
+  Consumer[Unchanged Meetings consumer] --> API[Reachability compatibility API]
+  API --> Runtime[Packaged Orpheus facade]
+  Runtime --> Worker[Worker state machine]
+  Worker --> ICE[Main-thread WebRTC probes]
+  Worker --> HTTP[Webex request bridge]
+  HTTP --> Discovery[Orpheus discovery service]
+  Runtime --> Preferences[SDK media preferences]
+  Preferences --> API
+  API --> Cache[Live and persisted cache]
+  API --> Locus[Locus preferences or v0 ROAP]
 ```
 
-## Sequence Diagram(s)
+## Build and packaging
 
-Sequence coverage:
+`yarn workspace @webex/plugin-meetings build:src` compiles the plugin and runs `build:orpheus` in the asset step. The runtime keeps relative module/Worker/Wasm URLs so the consumer bundler can emit its assets without application-specific configuration.
 
-| Operation group | Diagram | Failure coverage |
-|---|---|---|
-| UC-1…UC-5 — reachability discovery and probe operation groups | Reachability discovery and probe primary sequence | second discovery failure, absorbed gather failure, probe timeout/abort, and peer cleanup |
-| UC-1…UC-5 — reachability discovery and probe alternate/failure paths | Reachability discovery and probe alternate/failure sequence | cluster discovery failure, ICE timeout, peer-connection failure, unsupported protocol, or explicit stop |
+Prerequisites: the SDK Node/Yarn toolchain, Rust with the Wasm target, `wasm-pack` (verified locally with 0.13.1), and read access to the repository configured in `scripts/orpheus-reachability-source.json`. Source is cloned into an OS temporary cache. `ORPHEUS_SDK_DIR` optionally supplies an existing clean checkout at exactly the pinned revision; this is a build input, never a consumer runtime path. The script rebuilds Wasm and stages required files under ignored `dist/reachability/orpheus/`, recording revision and Wasm SHA-256 in `build.json`.
 
-### Reachability discovery and probe primary sequence
+Publishing is not part of the build. CI/release environments must provision the toolchain and authorized source access. A fork's GitHub token may not read the private Orpheus repository; do not work around that by committing binaries or credentials.
 
-```mermaid
-sequenceDiagram
-  participant C as Caller
-  participant R as Reachability index.ts
-  participant Q as request.ts
-  participant P as ReachabilityPeerConnection
-  C->>R: gatherReachability()
-  R->>Q: fetch clusters
-  Q-->>R: candidate cluster list
-  loop UDP, TCP, xtls per cluster
-    R->>P: start probe
-    P-->>R: reachable/unreachable after ICE or timeout
-  end
-  R->>R: build in-memory results/report data
-  R-->>C: defer settles undefined; disabled rejects; skipped/caught failure returns empty object
-```
+## Errors, security and measurement
 
-### Reachability discovery and probe alternate/failure sequence
+- Missing/invalid probes are not successful measurements. Disabled reachability rejects before the failure-absorbing gather boundary; unsupported browsers skip before runtime import.
+- Keep cookies/tokens in host credential/cache paths. Adapter diagnostics do not include raw exception text, response bodies, addresses or credentials. Orpheus uses its sanitized diagnostic dispatcher.
+- Request failures remain failures, with bounded SDK recovery. No second legacy probe engine runs as fallback.
+- NAT classification remains unknown where not supplied by Orpheus. ICE/probe latency is not a claim of pure network RTT.
 
-```mermaid
-sequenceDiagram
-  participant R as Reachability
-  participant P as Protocol probe
-  participant W as RTCPeerConnection
-  R->>P: probe cluster with udp, tcp, or xtls
-  P->>W: gather ICE candidates
-  alt candidate proves reachable
-    W-->>P: matching candidate
-    P-->>R: reachable result; close connection/timer
-  else timeout or terminal probe error
-    W--xP: timeout/error
-    P-->>R: unreachable result or rejection; close connection/timer
-  end
-```
+## Verification
 
-## Class / Component Relationships
+Focused command: `yarn workspace @webex/plugin-meetings test:unit --targets 'reachability/{index.ts,orpheus.ts,request.js,util.ts}'`.
 
-```mermaid
-classDiagram
-  class Caller
-  class Reach
-  class Request
-  class Service
-  class Cluster
-  class Probe
-  class ICE
-  Caller --> Reach
-  Reach --> Request
-  Request --> Service
-  Reach --> Cluster
-  Cluster --> Probe
-  Probe --> ICE
-  Probe --> Cluster
-  Cluster --> Reach
-  Reach --> Request
-```
+Retained `index.ts` cases cover public/video-mesh queries, fully-unreachable guards, backend conversion and metrics. New `orpheus.ts` cases cover 22-cluster projection, original authenticated requests, versioned report placement, disabled transports, readiness, initialization cancellation, stop races, storage failure and disposal. Authoritative probe-engine tests remain in Orpheus; local legacy-engine tests are replaced by adapter contracts.
 
-The arrows identify ownership and delegation inside `src/reachability/`; files that only declare types or constants are not presented as transports.
-
-## Use Cases
-
-- **UC-1:** Fetch clusters with one retry, store the returned join cookie, and start enabled `udp`, `tcp`, and `xtls` probes. Evidence: `src/reachability/index.ts`, `src/reachability/request.ts`.
-- **UC-2:** Settle each cluster/protocol probe once and close its timer and peer connection on success, failure, timeout, or abort. Evidence: `src/reachability/clusterReachability.ts`, `src/reachability/reachabilityPeerConnection.ts`.
-- **UC-3:** Reject before probing when reachability is disabled, return `{}` when WebRTC is unavailable or a discovery/probe setup failure is caught, and otherwise resolve the run's defer with `undefined` after storing results. Evidence: `src/reachability/index.ts`.
-- **UC-4:** Trigger fallback discovery when the minimum reachable-cluster threshold is missed, aborting the previous run before probing the replacement list. Evidence: `src/reachability/index.ts`.
-- **UC-5:** Read results as metrics, client media preferences, or a ROAP attachment without calling the dormant `ReachabilityRequest.remoteSDPForClusters()` helper. Evidence: `src/reachability/index.ts`, `src/reachability/request.ts`.
-
-## State Model
-
-Cluster/protocol probe state, peer connections, timers, partial results, and cached report data exist for one reachability run.
-
-## Business Rules & Invariants
-
-- Each probe settles once and closes its peer connection/timer; unsupported or failed protocols are reported rather than inferred reachable. Enforced by `src/reachability/index.ts` and supporting code under `src/reachability/`.
-
-## Concurrency & Reactive Flow
-
-- Each cluster/protocol probe owns one peer connection and timeout, settles once from its ICE/error/timeout path, and closes both resources before contributing to the aggregate. Cluster discovery is requested remotely; report/metric/ROAP shapes are constructed locally. Only failures inside `gatherReachability()`'s `try` are absorbed as `{}`; disabled configuration rejects before that boundary.
-
-## Protocol / Wire Format
-
-- External payloads are parsed/serialized by files under `src/reachability/` and existing Webex/media dependencies. Preserve current field names, enum/raw values, sequence identifiers, and compatibility behavior; do not treat the normalized client model as the wire schema.
-
-## Error Handling & Failure Modes
-
-| Condition | Signal | Caller recovery |
-|---|---|---|
-| Reachability is disabled in configuration | `gatherReachability()` throws `enableReachabilityChecks is disabled in config` from its `async` body before entering the catch block, which rejects the returned promise. | Enable the configured checks or handle the rejection; do not expect `{}` for this path. |
-| Cluster discovery still fails after `getClusters()` retries once | A direct `getClusters()` caller receives the rejection; `gatherReachability()` and fallback callers catch it and resolve with their documented empty/void outcome. | Distinguish direct discovery from the failure-absorbing gather APIs. |
-| ICE timeout or supported probe cannot establish reachability | The probe settles on its current unreachable/rejection path and closes its peer connection and timeout. | Record the explicit unreachable result; do not retain the probe connection. |
-| All `udp`, `tcp`, and `xtls` probes settle | The module stores aggregate protocol/cluster/NAT/IP-version results, emits completion, and resolves the gather defer with `undefined`; no report-submission call is made. | Read the stored/local report through the query/report helpers rather than expecting the gather promise to carry the result object. |
-
-## Pitfalls
-
-- Browser ICE callbacks and timeout can race. Cleanup must be idempotent and partial results must not be presented as a complete success.
-- Public behavior may be reachable through a parent `Meeting`/`Meetings` object even when the source helper is not exported directly.
-
-## Key Design Trade-off
-
-- Parallel probes reduce startup time but require per-probe isolation and deterministic aggregation.
-
-## Test-Case Strategy (module)
-
-Use the current mirrored suites: `test/unit/spec/reachability/clusterReachability.ts`, `test/unit/spec/reachability/index.ts`, `test/unit/spec/reachability/request.js`, `test/unit/spec/reachability/util.ts`. Characterize the reachability-specific use cases above and each listed failure condition; add cleanup or transition cases only for resources and state this module actually owns.
-
-| Behavior / Requirement | Existing test evidence | Gap |
-|---|---|---|
-| `REACHABILITY-R-001` | `test/unit/spec/reachability/index.ts` | cover discovery, probe, fallback, stop, query, and report-format groups |
-| `REACHABILITY-R-002` | `test/unit/spec/reachability/index.ts` | second discovery failure versus absorbed gather failure needs paired assertions |
-| `REACHABILITY-R-003` | `test/unit/spec/reachability/index.ts` | keep paired assertions for disabled-config rejection, WebRTC/caught-failure `{}`, successful `undefined` defer settlement, and no `remoteSDPForClusters()` invocation |
-| `REACHABILITY-R-004` | `test/unit/spec/reachability/clusterReachability.ts` | verify callback/timeout races |
-| `REACHABILITY-R-005` | `test/unit/spec/reachability/index.ts`, `test/unit/spec/reachability/request.js` | verify partial/mixed protocol reports |
-
-## Traceability
-
-- Repo architecture: [`ARCHITECTURE.md`](../../../ai-docs/ARCHITECTURE.md) · Registry: [`SPEC_INDEX.md`](../../../ai-docs/SPEC_INDEX.md)
-- Coverage state and contracts baseline: `../../../.sdd/manifest.json`
+Packaging tests: `node scripts/build-orpheus-reachability.test.cjs`. Build/type checking and browser validation are separate gates. Constructing preferences does not prove an outgoing Locus request: observe an authorized meeting join before claiming that. Cross-browser and symmetric-NAT characterization are separate verification work.

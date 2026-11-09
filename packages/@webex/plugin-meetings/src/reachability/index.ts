@@ -1,1130 +1,669 @@
 /*!
- * Copyright (c) 2015-2020 Cisco Systems, Inc. See LICENSE file.
+ * Copyright (c) 2015-2026 Cisco Systems, Inc. See LICENSE file.
  */
 
-/* eslint-disable class-methods-use-this */
-import {isEqual, mapValues, mean} from 'lodash';
-
-import {Defer} from '@webex/common';
 import {CapabilityState, WebCapabilities} from '@webex/web-capabilities';
+import EventsScope from '../common/events/events-scope';
 import LoggerProxy from '../common/logs/logger-proxy';
-import MeetingUtil from '../meeting/util';
-
 import {IP_VERSION, REACHABILITY} from '../constants';
-
-import ReachabilityRequest, {ClusterList} from './request';
-import {
-  ClusterReachabilityResult,
-  TransportResult,
+import MeetingUtil from '../meeting/util';
+import Metrics from '../metrics';
+import BEHAVIORAL_METRICS from '../metrics/constants';
+import OrpheusLoader from './orpheus-loader';
+import type {OrpheusFacade, OrpheusLogLevel} from './orpheus.types';
+import ReachabilityRequest from './request';
+import type {ClusterList} from './request';
+import {NatType} from './reachability.types';
+import type {
   ClientMediaPreferences,
+  GetClustersTrigger,
+  Protocol,
   ReachabilityMetrics,
   ReachabilityReportV0,
   ReachabilityReportV1,
   ReachabilityResults,
   ReachabilityResultsForBackend,
-  TransportResultForBackend,
-  GetClustersTrigger,
-  NatType,
-  Protocol,
+  TransportResult,
 } from './reachability.types';
-import {
-  ClientMediaIpsUpdatedEventData,
-  ClusterReachability,
-  Events,
-  NatTypeUpdatedEventData,
-  ResultEventData,
-} from './clusterReachability';
 import {isReachabilityEnabled, resolveReachabilityProtocols} from './util';
-import EventsScope from '../common/events/events-scope';
-import BEHAVIORAL_METRICS from '../metrics/constants';
-import Metrics from '../metrics';
 
-// timeouts in seconds
-const DEFAULT_TIMEOUT = 3;
-const VIDEO_MESH_TIMEOUT = 1;
-const OVERALL_TIMEOUT = 15;
+const protocols: Protocol[] = ['udp', 'tcp', 'xtls'];
+const READINESS_TIMEOUT_MS = 3000;
 
 /**
+ * Preserves the Meetings reachability contract while Orpheus owns discovery and probes.
  * @class Reachability
  * @export
  */
 export default class Reachability extends EventsScope {
   namespace = REACHABILITY.namespace;
-  webex: object;
+  webex: any;
   reachabilityRequest: ReachabilityRequest;
-  clusterReachability: {
-    [key: string]: ClusterReachability;
-  };
-
   minRequiredClusters?: number;
   orpheusApiVersion?: number;
-
-  reachabilityDefer?: Defer;
-
-  vmnTimer?: ReturnType<typeof setTimeout>;
-  publicCloudTimer?: ReturnType<typeof setTimeout>;
-  overallTimer?: ReturnType<typeof setTimeout>;
-
-  expectedResultsCount = {videoMesh: {udp: 0}, public: {udp: 0, tcp: 0, xtls: 0}};
-  resultsCount = {videoMesh: {udp: 0}, public: {udp: 0, tcp: 0, xtls: 0}};
-  startTime = undefined;
-  totalDuration = undefined;
   natType = NatType.Unknown;
-
+  totalDuration?: number;
   protected lastTrigger?: string;
+  private facade?: OrpheusFacade;
+  private loading?: Promise<OrpheusFacade>;
+  private run?: Promise<ReachabilityResults>;
+  private waiting?: Promise<ReachabilityResults>;
+  private settleWaiting?: (value?: ReachabilityResults) => void;
+  private readinessTimer?: ReturnType<typeof setTimeout>;
+  private generation = 0;
+  private closed = false;
+  private hybridClusters = new Set<string>();
+  private results?: ReachabilityResults;
+  private joinCookie?: unknown;
+  private readonly discard = () => this.shutdown();
 
   /**
-   * Creates an instance of Reachability.
-   * @param {object} webex
-   * @memberof Reachability
+   * Construct the compatibility controller without starting browser work.
+   * @param {*} webex - Webex SDK host.
    */
   constructor(webex: object) {
     super();
     this.webex = webex;
-
-    /**
-     * internal request object for the server
-     * @instance
-     * @type {Array}
-     * @private
-     * @memberof Reachability
-     */
-    this.reachabilityRequest = new ReachabilityRequest(this.webex);
-
-    this.clusterReachability = {};
+    this.reachabilityRequest = new ReachabilityRequest(webex);
   }
 
   /**
-   * Fetches the list of media clusters from the backend
-   * @param {string} trigger - explains the reason for starting reachability, used by Orpheus
-   * @param {Object} previousReport - last reachability report
-   * @param {boolean} isRetry
-   * @private
-   * @returns {Promise<{clusters: ClusterList, joinCookie: any}>}
+   * Load one packaged Orpheus facade for this SDK instance.
+   * @returns {Promise<OrpheusFacade>} The browser facade.
    */
-  async getClusters(
-    trigger: GetClustersTrigger,
-    previousReport?: any,
-    isRetry = false
-  ): Promise<{
-    clusters: ClusterList;
-    joinCookie: any;
-  }> {
+  private async getFacade(): Promise<OrpheusFacade> {
+    if (this.closed) throw new Error('Reachability has been shut down');
+    if (!this.loading) {
+      const {generation} = this;
+      this.loading = OrpheusLoader.load()
+        .then(({OrpheusReachability}) => {
+          if (this.closed || generation !== this.generation)
+            throw new Error('Reachability initialization retired');
+          const routeUrl = this.webex.internal.services.get('calliopeDiscovery');
+          const browserOrigin = globalThis.location?.origin ?? globalThis.window?.location?.origin;
+          const pageOrigin =
+            browserOrigin && browserOrigin !== 'null' ? browserOrigin : new URL(routeUrl).origin;
+          const appType = this.webex.config?.support?.appType;
+          const appVersion = this.webex.config?.support?.appVersion;
+          const facade = new OrpheusReachability({
+            routeUrl: routeUrl ?? new URL('/calliope/api/', pageOrigin).href,
+            pageOrigin,
+            getBearer: async () => (await this.webex.credentials.getUserToken()).access_token,
+            fetchImpl: (input, init) => this.fetchDiscovery(input, init),
+            getIpVersion: () => MeetingUtil.getIpVersion(this.webex),
+            getClientEnvironment:
+              appType && appVersion ? () => ({components: {[appType]: appVersion}}) : undefined,
+            logger: this.webex.logger ?? LoggerProxy.logger,
+            logLevel: this.webex.config.meetings.orpheusReachabilityLogLevel ?? 'warn',
+          });
+          facade.on('reachability:firstResultAvailable', (payload) => {
+            this.emit(
+              {file: 'reachability', function: 'firstResult'},
+              'reachability:firstResultAvailable',
+              payload
+            );
+          });
+          this.facade = facade;
+          globalThis.window?.addEventListener('pagehide', this.discard, {once: true});
+
+          return facade;
+        })
+        .catch((error) => {
+          this.loading = undefined;
+          throw error;
+        });
+    }
+
+    return this.loading;
+  }
+
+  /**
+   * Route the SDK-owned discovery request through Webex authentication and interceptors.
+   * @param {*} input - Logical discovery URL.
+   * @param {*} init - Fetch request options.
+   * @returns {Promise<Response>} Discovery response with configured transport policy applied.
+   */
+  private async fetchDiscovery(
+    input: RequestInfo | URL,
+    init: RequestInit = {}
+  ): Promise<Response> {
+    const {generation} = this;
+    const resource = new URL(String(input)).pathname.split('/').pop();
+    if (resource !== 'clusters' && resource !== 'publicClusters')
+      throw new Error('Unsupported discovery resource');
+    const body =
+      init.body == null
+        ? undefined
+        : JSON.parse(
+            init.body instanceof Uint8Array
+              ? new TextDecoder().decode(init.body)
+              : String(init.body)
+          );
+    const request = () =>
+      this.webex.request({
+        api: 'calliopeDiscovery',
+        resource,
+        method: init.method ?? 'POST',
+        headers: Object.fromEntries(new Headers(init.headers).entries()),
+        body,
+        signal: init.signal,
+        shouldRefreshAccessToken: false,
+        timeout: this.webex.config.meetings.reachabilityGetClusterTimeout,
+      });
+    const latency = this.webex.internal.newMetrics?.callDiagnosticLatencies;
+    const response =
+      body?.trigger === 'startup' && latency
+        ? await latency.measureLatency(request, 'internal.get.cluster.time')
+        : await request();
+    if (init.signal?.aborted || generation !== this.generation || this.closed) {
+      throw new DOMException('Discovery request aborted', 'AbortError');
+    }
+    const data = response.body ?? {};
+    if ((response.statusCode ?? response.status ?? 200) === 200) {
+      this.minRequiredClusters = data.discoveryOptions?.['early-call-min-clusters'];
+      this.orpheusApiVersion = data.discoveryOptions?.['report-version'];
+      this.hybridClusters = new Set(data.clusterClasses?.hybridMedia ?? []);
+      if (data.joinCookie !== undefined)
+        await this.writeStorage(REACHABILITY.localStorageJoinCookie, data.joinCookie);
+    }
+    const enabled = resolveReachabilityProtocols(
+      this.webex.config.meetings.enableReachabilityChecks
+    );
+    const clusters =
+      data.clusters &&
+      Object.fromEntries(
+        Object.entries(data.clusters).map(([id, cluster]) => [
+          id,
+          {
+            ...(cluster as object),
+            ...(!enabled.tcp && {tcp: []}),
+            ...(!enabled.tls && {xtls: []}),
+          },
+        ])
+      );
+
+    return new Response(JSON.stringify({...data, ...(clusters && {clusters})}), {
+      status: response.statusCode ?? response.status ?? 200,
+      headers: response.headers,
+    });
+  }
+
+  /**
+   * Gather reachability, retaining disabled, unsupported and completion semantics.
+   * @param {*} trigger - Caller reason for the run.
+   * @returns {Promise<Object>} Empty object on skipped/failed work; undefined on completed work.
+   */
+  public async gatherReachability(trigger: string): Promise<ReachabilityResults> {
+    if (!isReachabilityEnabled(this.webex.config.meetings.enableReachabilityChecks)) {
+      throw new Error('enableReachabilityChecks is disabled in config');
+    }
+    if (
+      WebCapabilities.supportsRTCPeerConnection() !== CapabilityState.CAPABLE ||
+      typeof globalThis.Worker !== 'function'
+    )
+      return {};
+    if (this.run) return this.waiting ?? this.run;
+    this.lastTrigger = trigger;
+    this.generation += 1;
+    const {generation} = this;
+    this.waiting = new Promise((resolve) => {
+      this.settleWaiting = resolve;
+    });
+    const {waiting} = this;
+    this.readinessTimer = setTimeout(() => {
+      if (generation === this.generation) this.releaseWaiting();
+    }, READINESS_TIMEOUT_MS);
+    this.run = this.gather(trigger, generation).then((value) => {
+      if (generation === this.generation) {
+        this.run = undefined;
+        this.releaseWaiting(value);
+      }
+
+      return value;
+    });
+
+    return waiting;
+  }
+
+  /**
+   * Release registration readiness while allowing the SDK's full gather to continue.
+   * @param {*} value - Legacy gather completion value.
+   * @returns {void}
+   */
+  private releaseWaiting(value?: ReachabilityResults): void {
+    if (this.readinessTimer) clearTimeout(this.readinessTimer);
+    this.readinessTimer = undefined;
+    this.settleWaiting?.(value);
+    this.settleWaiting = undefined;
+  }
+
+  /**
+   * Run and persist one correlated gather, ignoring work retired by stop.
+   * @param {*} trigger - Caller reason.
+   * @param {*} generation - Local run generation.
+   * @returns {Promise<Object>} Legacy gather completion.
+   */
+  private async gather(trigger: string, generation: number): Promise<ReachabilityResults> {
     try {
-      const {clusters, joinCookie, discoveryOptions} = await this.reachabilityRequest.getClusters(
+      const detector = this.webex.internal.device?.ipNetworkDetector;
+      Promise.resolve(detector?.detect(true)).catch(() => {});
+      const facade = await this.getFacade();
+      if (generation !== this.generation) return undefined;
+      await facade.gatherReachability(trigger);
+      if (generation !== this.generation) return undefined;
+      const preferences = await facade.getClientMediaPreferences(
+        true,
+        MeetingUtil.getIpVersion(this.webex)
+      );
+      if (generation !== this.generation) return undefined;
+      await this.storePreferences(preferences);
+      if (generation !== this.generation) return undefined;
+      this.emit({file: 'reachability', function: 'gatherReachability'}, 'reachability:done', {});
+      await this.sendMetric();
+
+      return undefined;
+    } catch {
+      if (generation !== this.generation) return undefined;
+      LoggerProxy.logger.warn('Reachability: Orpheus gathering failed');
+
+      return {};
+    }
+  }
+
+  /**
+   * Retain the direct discovery helper for existing advanced consumers.
+   * @param {*} trigger - Discovery reason.
+   * @param {*} previousReport - Previous report context.
+   * @param {*} isRetry - Whether the single retry has already been attempted.
+   * @returns {Promise<Object>} Cluster list and join cookie.
+   */
+  public async getClusters(
+    trigger: GetClustersTrigger,
+    previousReport?: unknown,
+    isRetry = false
+  ): Promise<{clusters: ClusterList; joinCookie: unknown}> {
+    try {
+      const response = await this.reachabilityRequest.getClusters(
         trigger,
         MeetingUtil.getIpVersion(this.webex),
         previousReport
       );
+      this.minRequiredClusters = response.discoveryOptions?.['early-call-min-clusters'];
+      this.orpheusApiVersion = response.discoveryOptions?.['report-version'];
+      await this.writeStorage(REACHABILITY.localStorageJoinCookie, response.joinCookie);
 
-      this.minRequiredClusters = discoveryOptions?.['early-call-min-clusters'];
-      this.orpheusApiVersion = discoveryOptions?.['report-version'];
-
-      // @ts-ignore
-      await this.webex.boundedStorage.put(
-        this.namespace,
-        REACHABILITY.localStorageJoinCookie,
-        JSON.stringify(joinCookie)
-      );
-
-      return {clusters, joinCookie};
+      return response;
     } catch (error) {
-      if (isRetry) {
-        throw error;
-      }
-
-      LoggerProxy.logger.error(
-        `Reachability:index#getClusters --> Failed with error: ${error}, retrying...`
-      );
+      if (isRetry) throw error;
 
       return this.getClusters(trigger, previousReport, true);
     }
   }
 
   /**
-   * Checks if the given subnet is reachable
-   * @param {string} selectedSubnetFirstOctet - selected subnet first octet, e.g. "10" for "10.X.X.X"
-   * @returns {boolean | null} true if reachable, false if not reachable, null if mediaServerIp is not provided
-   * @public
-   * @memberof Reachability
+   * Request a fresh SDK-owned discovery run after stopping prior work.
+   * @returns {Promise<void>} Completion of the fallback attempt.
    */
-  public isSubnetReachable(selectedSubnetFirstOctet: string): boolean | null {
-    LoggerProxy.logger.info(
-      `Reachability:index#isSubnetReachable --> Looking for subnet: ${selectedSubnetFirstOctet}.X.X.X`
-    );
-
-    const matchingReachedClusters = Object.values(this.clusterReachability).reduce(
-      (acc, cluster) => {
-        const reachedSubnetsArray = Array.from(cluster.reachedSubnets);
-
-        let logMessage = `Reachability:index#isSubnetReachable --> Cluster ${cluster.name} reached [`;
-        for (let i = 0; i < reachedSubnetsArray.length; i += 1) {
-          const subnet = reachedSubnetsArray[i];
-          const reachedSubnetFirstOctet = subnet.split('.')[0];
-
-          if (selectedSubnetFirstOctet === reachedSubnetFirstOctet) {
-            acc.add(cluster.name);
-          }
-
-          logMessage += `${subnet}`;
-          if (i < reachedSubnetsArray.length - 1) {
-            logMessage += ',';
-          }
-        }
-        logMessage += `]`;
-
-        LoggerProxy.logger.info(logMessage);
-
-        return acc;
-      },
-      new Set<string>()
-    );
-
-    LoggerProxy.logger.info(
-      `Reachability:index#isSubnetReachable --> Found ${matchingReachedClusters.size} clusters that use the subnet ${selectedSubnetFirstOctet}.X.X.X`
-    );
-
-    return matchingReachedClusters.size > 0;
+  public async gatherReachabilityFallback(): Promise<void> {
+    this.stopReachability();
+    await this.gatherReachability('early-call/no-min-reached').catch(() => {});
   }
 
   /**
-   * Gets a list of media clusters from the backend and performs reachability checks on all the clusters
-   * @param {string} trigger - explains the reason for starting reachability
-   * @returns {Promise<ReachabilityResults>} reachability results
-   * @public
-   * @memberof Reachability
+   * Stop active probes and refresh work without discarding completed results.
+   * @returns {void}
    */
-  public async gatherReachability(trigger: string): Promise<ReachabilityResults> {
-    // @ts-ignore
-    if (!isReachabilityEnabled(this.webex.config.meetings.enableReachabilityChecks)) {
-      throw new Error('enableReachabilityChecks is disabled in config');
+  public stopReachability(): void {
+    const active = !!this.run;
+    this.generation += 1;
+    this.run = undefined;
+    this.releaseWaiting();
+    this.waiting = undefined;
+    this.facade?.stopReachability();
+    if (active) {
+      this.emit({file: 'reachability', function: 'stopReachability'}, 'reachability:stopped', {});
+      this.sendMetric(true).catch(() => {});
     }
+  }
 
-    if (WebCapabilities.supportsRTCPeerConnection() !== CapabilityState.CAPABLE) {
-      LoggerProxy.logger.warn(
-        'Reachability:index#gatherReachability --> WebRTC API is not available, skipping reachability checks'
-      );
+  /**
+   * Dispose the browser runtime and page listener exactly once.
+   * @returns {void}
+   */
+  public shutdown(): void {
+    if (this.closed) return;
+    this.stopReachability();
+    this.closed = true;
+    this.facade?.shutdown();
+    globalThis.window?.removeEventListener('pagehide', this.discard);
+  }
 
-      return {};
+  /**
+   * Expose the SDK's sanitized diagnostics without raw results or credentials.
+   * @returns {Object} Diagnostic counters and status.
+   */
+  public getDiagnostics(): Record<string, unknown> {
+    return this.facade?.getDiagnostics() ?? {implementation: 'OrpheusReachability', ready: false};
+  }
+
+  /**
+   * Configure Orpheus verbosity without bypassing the Webex logger.
+   * @param {*} level - SDK diagnostic threshold.
+   * @returns {void}
+   */
+  public setLogLevel(level: OrpheusLogLevel): void {
+    if (!['silent', 'error', 'warn', 'info', 'debug'].includes(level)) {
+      throw new TypeError('Invalid Orpheus log level');
     }
-    // Fetch clusters and measure latency
+    this.webex.config.meetings.orpheusReachabilityLogLevel = level;
+    this.facade?.setLogLevel(level);
+  }
+
+  /**
+   * Read the configured Orpheus diagnostic threshold.
+   * @returns {string} Current threshold, defaulting to warn.
+   */
+  public getLogLevel(): OrpheusLogLevel {
+    return (
+      this.facade?.getLogLevel() ?? this.webex.config.meetings.orpheusReachabilityLogLevel ?? 'warn'
+    );
+  }
+
+  /**
+   * Persist compatibility data without making cache availability a probe prerequisite.
+   * @param {*} key - Reachability storage key.
+   * @param {*} value - Value to serialize.
+   * @returns {Promise<void>} Cache write completion.
+   */
+  private async writeStorage(key: string, value: unknown): Promise<void> {
+    if (key === REACHABILITY.localStorageJoinCookie) this.joinCookie = value;
     try {
-      this.lastTrigger = trigger;
+      await this.webex.boundedStorage.put(this.namespace, key, JSON.stringify(value));
+    } catch {
+      LoggerProxy.logger.warn('Reachability: unable to persist cached data');
+    }
+  }
 
-      // kick off ip version detection. We don't await it, as we don't want to waste time
-      // and if it fails, that's ok we can still carry on
-      // @ts-ignore
-      this.webex.internal.device.ipNetworkDetector.detect(true);
-
-      const {clusters} = await this.getClusters('startup');
-
-      this.reachabilityDefer = new Defer();
-
-      // Perform Reachability Check
-      await this.performReachabilityChecks(clusters);
-
-      return this.reachabilityDefer.promise;
-    } catch (error) {
-      LoggerProxy.logger.error(`Reachability:index#gatherReachability --> Error:`, error);
-
+  /**
+   * Read live results first, then previously persisted legacy-compatible results.
+   * @returns {Promise<Object>} Cached cluster results.
+   */
+  private async readResults(): Promise<ReachabilityResults> {
+    if (this.results) return this.results;
+    try {
+      return (
+        JSON.parse(
+          await this.webex.boundedStorage.get(this.namespace, REACHABILITY.localStorageResult)
+        ) ?? {}
+      );
+    } catch {
       return {};
     }
   }
 
   /**
-   * Gets the last join cookie we got from Orpheus
-   *
-   * @returns {Promise<Object>} join cookie
+   * Project the complete SDK report into the existing storage contract.
+   * @param {*} preferences - SDK media preferences.
+   * @returns {Promise<void>} Projection and cache write completion.
    */
-  async getJoinCookie() {
-    // @ts-ignore
-    const joinCookieRaw = await this.webex.boundedStorage
-      .get(REACHABILITY.namespace, REACHABILITY.localStorageJoinCookie)
-      .catch(() => {});
+  private async storePreferences(preferences: ClientMediaPreferences): Promise<void> {
+    if (preferences.joinCookie !== undefined)
+      await this.writeStorage(REACHABILITY.localStorageJoinCookie, preferences.joinCookie);
+    const report = preferences.reachability;
+    if (!report) return;
+    this.totalDuration = report.result.metrics['total-duration-ms'];
+    const results: ReachabilityResults = {};
+    for (const [id, cluster] of Object.entries(report.result.tests)) {
+      const convert = (protocol: Protocol): TransportResult => {
+        const value = cluster[protocol];
 
-    let joinCookie;
+        let result: TransportResult['result'] = 'untested';
+        if (value.reachable === 'true') result = 'reachable';
+        if (value.reachable === 'false') result = 'unreachable';
 
-    if (joinCookieRaw) {
-      try {
-        joinCookie = JSON.parse(joinCookieRaw);
-      } catch (e) {
-        LoggerProxy.logger.error(
-          `MeetingRequest#constructor --> Error in parsing join cookie data: ${e}`
-        );
-      }
-    }
-
-    return joinCookie;
-  }
-
-  /**
-   * Returns the reachability report that needs to be attached to the ROAP messages
-   * that we send to the backend.
-   *
-   * @returns {Promise<Object>}
-   */
-  async getReachabilityReport(): Promise<
-    | {
-        joinCookie: any;
-        reachability?: ReachabilityReportV1;
-      }
-    | {
-        reachability: ReachabilityReportV0;
-      }
-  > {
-    const reachabilityResult = await this.getReachabilityResults();
-    const joinCookie = await this.getJoinCookie();
-
-    // Orpheus API version 0
-    if (!this.orpheusApiVersion) {
-      return {
-        reachability: reachabilityResult,
+        return {
+          result,
+          ...(value.latencyInMilliseconds !== undefined && {
+            latencyInMilliseconds: Number(value.latencyInMilliseconds),
+          }),
+          ...(value.clientMediaIPs && {clientMediaIPs: value.clientMediaIPs}),
+        };
+      };
+      results[id] = {
+        udp: convert('udp'),
+        tcp: convert('tcp'),
+        xtls: convert('xtls'),
+        isVideoMesh: this.hybridClusters.has(id),
       };
     }
+    this.results = results;
+    await this.writeStorage(REACHABILITY.localStorageResult, results);
+  }
 
-    // Orpheus API version 1
+  /**
+   * Read the current discovery cookie or a previously persisted cookie.
+   * @returns {Promise<*>} Join cookie, if available.
+   */
+  public async getJoinCookie(): Promise<unknown> {
+    if (this.joinCookie !== undefined) return this.joinCookie;
+    try {
+      return JSON.parse(
+        await this.webex.boundedStorage.get(this.namespace, REACHABILITY.localStorageJoinCookie)
+      );
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Convert cached transport outcomes into the backend's string-valued format.
+   * @returns {Promise<Object>} Complete cluster matrix, or undefined when no result exists.
+   */
+  public async getReachabilityResults(): Promise<ReachabilityResultsForBackend | undefined> {
+    const results = await this.readResults();
+    if (!Object.keys(results).length) return undefined;
+
+    return Object.fromEntries(
+      Object.entries(results).map(([id, cluster]) => [
+        id,
+        Object.fromEntries(
+          protocols.map((protocol) => {
+            const value = cluster[protocol] ?? {result: 'untested'};
+
+            return [
+              protocol,
+              {
+                ...(value.result === 'untested'
+                  ? {untested: 'true'}
+                  : {reachable: value.result === 'reachable' ? 'true' : 'false'}),
+                ...(value.latencyInMilliseconds !== undefined && {
+                  latencyInMilliseconds: String(value.latencyInMilliseconds),
+                }),
+                ...(value.clientMediaIPs && {clientMediaIPs: value.clientMediaIPs}),
+              },
+            ];
+          })
+        ),
+      ])
+    ) as ReachabilityResultsForBackend;
+  }
+
+  /**
+   * Format the negotiated version-zero or version-one report.
+   * @returns {Promise<Object>} Versioned reachability report.
+   */
+  public async getReachabilityReport(): Promise<{
+    joinCookie?: unknown;
+    reachability?: ReachabilityReportV0 | ReachabilityReportV1;
+  }> {
+    const tests = await this.getReachabilityResults();
+    if (!this.orpheusApiVersion) return {reachability: tests};
+
     return {
+      joinCookie: await this.getJoinCookie(),
       reachability: {
         version: 1,
         result: {
-          usedDiscoveryOptions: {
-            'early-call-min-clusters': this.minRequiredClusters,
-          },
-          metrics: {
-            'total-duration-ms': this.totalDuration,
-          },
-          tests: reachabilityResult,
+          usedDiscoveryOptions: {'early-call-min-clusters': this.minRequiredClusters},
+          metrics: {'total-duration-ms': this.totalDuration},
+          tests,
         },
       },
-      joinCookie,
     };
   }
 
   /**
-   * This method is called when we don't succeed in reaching the minimum number of clusters
-   * required by Orpheus. It sends the results to Orpheus and gets a new list that it tries to reach again.
-   * @returns {Promise<ReachabilityResults>} reachability results
-   * @public
-   * @memberof Reachability
+   * Read real SDK preferences and preserve the negotiated report placement.
+   * @param {*} isMultistream - Whether multistream is enabled.
+   * @param {*} ipver - Detected IP version, if known.
+   * @returns {Promise<Object>} Client media preferences for Locus.
    */
-  public async gatherReachabilityFallback(): Promise<void> {
-    try {
-      const reachabilityReport = await this.getReachabilityReport();
-
-      const {clusters} = await this.getClusters('early-call/no-min-reached', reachabilityReport);
-
-      // stop all previous reachability checks that might still be going on in the background
-      this.abortCurrentChecks();
-
-      // Perform Reachability Check
-      await this.performReachabilityChecks(clusters);
-    } catch (error) {
-      LoggerProxy.logger.error(`Reachability:index#gatherReachabilityFallback --> Error:`, error);
-    }
-  }
-
-  /**
-   * Stops all reachability checks that are in progress
-   * @public
-   * @memberof Reachability
-   * @returns {void}
-   */
-  public stopReachability() {
-    // overallTimer is always there only if there is reachability in progress
-    if (this.overallTimer) {
-      LoggerProxy.logger.log(
-        'Reachability:index#stopReachability --> stopping reachability checks'
-      );
-      this.abortCurrentChecks();
-      this.emit(
-        {
-          file: 'reachability',
-          function: 'stopReachability',
-        },
-        'reachability:stopped',
-        {}
-      );
-      this.sendMetric(true);
-      this.resolveReachabilityPromise(false);
-    }
-  }
-
-  /**
-   * Returns statistics about last reachability results. The returned value is an object
-   * with a flat list of properties so that it can be easily sent with metrics
-   *
-   * @returns {Promise} Promise with metrics values, it never rejects/throws.
-   */
-  async getReachabilityMetrics(): Promise<ReachabilityMetrics> {
-    const stats: ReachabilityMetrics = {
-      reachability_public_udp_success: 0,
-      reachability_public_udp_failed: 0,
-      reachability_public_tcp_success: 0,
-      reachability_public_tcp_failed: 0,
-      reachability_public_xtls_success: 0,
-      reachability_public_xtls_failed: 0,
-      reachability_vmn_udp_success: 0,
-      reachability_vmn_udp_failed: 0,
-      reachability_vmn_tcp_success: 0,
-      reachability_vmn_tcp_failed: 0,
-      reachability_vmn_xtls_success: 0,
-      reachability_vmn_xtls_failed: 0,
-      natType: this.natType,
-    };
-
-    const updateStats = (clusterType: 'public' | 'vmn', result: ClusterReachabilityResult) => {
-      if (result.udp && result.udp.result !== 'untested') {
-        const outcome = result.udp.result === 'reachable' ? 'success' : 'failed';
-        stats[`reachability_${clusterType}_udp_${outcome}`] += 1;
-      }
-      if (result.tcp && result.tcp.result !== 'untested') {
-        const outcome = result.tcp.result === 'reachable' ? 'success' : 'failed';
-        stats[`reachability_${clusterType}_tcp_${outcome}`] += 1;
-      }
-      if (result.xtls && result.xtls.result !== 'untested') {
-        const outcome = result.xtls.result === 'reachable' ? 'success' : 'failed';
-        stats[`reachability_${clusterType}_xtls_${outcome}`] += 1;
-      }
-    };
-
-    try {
-      // @ts-ignore
-      const resultsJson = await this.webex.boundedStorage.get(
-        REACHABILITY.namespace,
-        REACHABILITY.localStorageResult
-      );
-
-      const results: ReachabilityResults = JSON.parse(resultsJson);
-
-      Object.values(results).forEach((result) => {
-        updateStats(result.isVideoMesh ? 'vmn' : 'public', result);
-      });
-    } catch (e) {
-      // empty storage, that's ok
-      LoggerProxy.logger.warn(
-        'Roap:request#getReachabilityMetrics --> Error parsing reachability data: ',
-        e
-      );
-    }
-
-    return stats;
-  }
-
-  /**
-   * Maps our internal transport result to the format that backend expects
-   * @param {TransportResult} transportResult
-   * @returns {TransportResultForBackend}
-   */
-  private mapTransportResultToBackendDataFormat(
-    transportResult: TransportResult
-  ): TransportResultForBackend {
-    const output: TransportResultForBackend = {};
-
-    for (const [key, value] of Object.entries(transportResult)) {
-      switch (key) {
-        case 'result':
-          switch (value) {
-            case 'reachable':
-              output.reachable = 'true';
-              break;
-            case 'unreachable':
-              output.reachable = 'false';
-              break;
-            case 'untested':
-              output.untested = 'true';
-              break;
-          }
-          break;
-        case 'latencyInMilliseconds':
-          output.latencyInMilliseconds = value.toString();
-          break;
-        default:
-          output[key] = value;
-      }
-    }
-
-    return output;
-  }
-
-  /**
-   * Reachability results as an object in the format that backend expects
-   *
-   * @returns {any} reachability results that need to be sent to the backend
-   */
-  async getReachabilityResults(): Promise<ReachabilityResultsForBackend | undefined> {
-    let results: ReachabilityResultsForBackend;
-
-    try {
-      // @ts-ignore
-      const resultsJson = await this.webex.boundedStorage.get(
-        REACHABILITY.namespace,
-        REACHABILITY.localStorageResult
-      );
-
-      const allClusterResults: ReachabilityResults = JSON.parse(resultsJson);
-
-      results = mapValues(allClusterResults, (clusterResult) => ({
-        udp: this.mapTransportResultToBackendDataFormat(clusterResult.udp || {result: 'untested'}),
-        tcp: this.mapTransportResultToBackendDataFormat(clusterResult.tcp || {result: 'untested'}),
-        xtls: this.mapTransportResultToBackendDataFormat(
-          clusterResult.xtls || {result: 'untested'}
-        ),
-      }));
-    } catch (e) {
-      // empty storage, that's ok
-      LoggerProxy.logger.warn(
-        'Reachability:index#getReachabilityResults --> Error parsing reachability data: ',
-        e
-      );
-    }
-
-    return results;
-  }
-
-  /**
-   * fetches reachability data and checks for cluster reachability
-   * @returns {boolean}
-   * @public
-   * @memberof Reachability
-   */
-  async isAnyPublicClusterReachable() {
-    let reachable = false;
-    // @ts-ignore
-    const reachabilityData = await this.webex.boundedStorage
-      .get(this.namespace, REACHABILITY.localStorageResult)
-      .catch(() => {});
-
-    if (reachabilityData) {
-      try {
-        const reachabilityResults: ReachabilityResults = JSON.parse(reachabilityData);
-
-        reachable = Object.values(reachabilityResults).some(
-          (result) =>
-            !result.isVideoMesh &&
-            (result.udp?.result === 'reachable' || result.tcp?.result === 'reachable')
-        );
-      } catch (e) {
-        LoggerProxy.logger.error(
-          `Reachability:index#isAnyPublicClusterReachable --> Error in parsing reachability data: ${e}`
-        );
-      }
-    }
-
-    return reachable;
-  }
-
-  /**
-   * Returns true only if ALL protocols (UDP, TCP and TLS) have been tested and none
-   * of the media clusters where reachable with any of the protocols. This is done
-   * irrespective of the config, so for example:
-   * if config.meetings.enableReachabilityChecks disables TLS,
-   * it will return false, because TLS reachability won't be tested,
-   * so we can't say for sure that media backend is unreachable over TLS.
-   *
-   * @returns {boolean}
-   */
-  async isWebexMediaBackendUnreachable() {
-    let unreachable = false;
-
-    // @ts-ignore
-    const reachabilityData = await this.webex.boundedStorage
-      .get(this.namespace, REACHABILITY.localStorageResult)
-      .catch(() => {});
-
-    if (reachabilityData) {
-      try {
-        const reachabilityResults: ReachabilityResults = JSON.parse(reachabilityData);
-
-        const protocols = {
-          udp: {tested: false, reachable: undefined},
-          tcp: {tested: false, reachable: undefined},
-          xtls: {tested: false, reachable: undefined},
-        };
-
-        Object.values(reachabilityResults).forEach((result) => {
-          Object.keys(protocols).forEach((protocol) => {
-            if (
-              result[protocol]?.result === 'reachable' ||
-              result[protocol]?.result === 'unreachable'
-            ) {
-              protocols[protocol].tested = true;
-
-              // we need at least 1 'reachable' result to mark the whole protocol as reachable
-              if (result[protocol].result === 'reachable') {
-                protocols[protocol].reachable = true;
-              }
-            }
-          });
-        });
-
-        unreachable = Object.values(protocols).every(
-          (protocol) => protocol.tested && !protocol.reachable
-        );
-      } catch (e) {
-        LoggerProxy.logger.error(
-          `Reachability:index#isWebexMediaBackendUnreachable --> Error in parsing reachability data: ${e}`
-        );
-      }
-    }
-
-    return unreachable;
-  }
-
-  /**
-   * Checks if any cluster is reachable via the given protocol based on stored reachability results.
-   *
-   * @param {string} protocol - the protocol to check ('udp', 'tcp', or 'xtls')
-   * @returns {Promise<boolean>} true if at least one cluster has a 'reachable' result for the given protocol
-   */
-  async isAnyClusterReachableViaProtocol(protocol: Protocol): Promise<boolean> {
-    try {
-      // @ts-ignore
-      const resultsJson = await this.webex.boundedStorage.get(
-        this.namespace,
-        REACHABILITY.localStorageResult
-      );
-
-      const results: ReachabilityResults = JSON.parse(resultsJson);
-
-      return Object.values(results).some((result) => result[protocol]?.result === 'reachable');
-    } catch (e) {
-      LoggerProxy.logger.warn(
-        `Reachability:index#isAnyClusterReachableViaProtocol --> Error reading reachability data: ${e}`
-      );
-
-      return false;
-    }
-  }
-
-  /**
-   * Get list of all unreachable clusters
-   * @returns {array} Unreachable clusters
-   * @private
-   * @memberof Reachability
-   */
-  private getUnreachableClusters(): Array<{name: string; protocol: string}> {
-    const unreachableList = [];
-
-    Object.entries(this.clusterReachability).forEach(([key, clusterReachability]) => {
-      const result = clusterReachability.getResult();
-
-      if (result.udp.result === 'unreachable') {
-        unreachableList.push({name: key, protocol: 'udp'});
-      }
-      if (result.tcp.result === 'unreachable') {
-        unreachableList.push({name: key, protocol: 'tcp'});
-      }
-      if (result.xtls.result === 'unreachable') {
-        unreachableList.push({name: key, protocol: 'xtls'});
-      }
-    });
-
-    return unreachableList;
-  }
-
-  /**
-   * Gets the number of reachable clusters from last run reachability check
-   * @returns {number} reachable clusters count
-   * @private
-   * @memberof Reachability
-   */
-  private getNumberOfReachableClusters(): number {
-    let count = 0;
-
-    Object.entries(this.clusterReachability).forEach(([key, clusterReachability]) => {
-      const result = clusterReachability.getResult();
-
-      if (
-        result.udp.result === 'reachable' ||
-        result.tcp.result === 'reachable' ||
-        result.xtls.result === 'reachable'
-      ) {
-        count += 1;
-      }
-    });
-
-    return count;
-  }
-
-  /**
-   * Make a log of unreachable clusters.
-   * @returns {undefined}
-   * @private
-   * @memberof Reachability
-   */
-  private logUnreachableClusters() {
-    const list = this.getUnreachableClusters();
-
-    list.forEach(({name, protocol}) => {
-      LoggerProxy.logger.log(
-        `Reachability:index#logUnreachableClusters --> failed to reach ${name} over ${protocol}`
-      );
-    });
-  }
-
-  /**
-   * Returns true if we've obtained all the reachability results for all the public clusters
-   * In other words, it means that all public clusters are reachable over each protocol,
-   * because we only get a "result" if we managed to reach a cluster
-   *
-   * @returns {boolean}
-   */
-  private areAllPublicClusterResultsReady() {
-    return isEqual(this.expectedResultsCount.public, this.resultsCount.public);
-  }
-
-  /**
-   * Returns true if we've obtained all the reachability results for all the clusters
-   *
-   * @returns {boolean}
-   */
-  private areAllResultsReady() {
-    return isEqual(this.expectedResultsCount, this.resultsCount);
-  }
-
-  /**
-   * Resolves the promise returned by gatherReachability() method
-   * @param {boolean} checkMinRequiredClusters - if true, it will check if we have reached the minimum required clusters and do a fallback if needed
-   * @returns {void}
-   */
-  private resolveReachabilityPromise(checkMinRequiredClusters = true) {
-    this.totalDuration = performance.now() - this.startTime;
-
-    this.clearTimer('vmnTimer');
-    this.clearTimer('publicCloudTimer');
-
-    this.logUnreachableClusters();
-    this.reachabilityDefer?.resolve();
-
-    if (checkMinRequiredClusters) {
-      const numReachableClusters = this.getNumberOfReachableClusters();
-      if (this.minRequiredClusters && numReachableClusters < this.minRequiredClusters) {
-        LoggerProxy.logger.log(
-          `Reachability:index#resolveReachabilityPromise --> minRequiredClusters not reached (${numReachableClusters} < ${this.minRequiredClusters}), doing reachability fallback`
-        );
-        this.gatherReachabilityFallback();
-      }
-    }
-  }
-
-  /**
-   * Aborts all cluster reachability checks that are in progress
-   *
-   * @returns {void}
-   */
-  private abortClusterReachability() {
-    Object.values(this.clusterReachability).forEach((clusterReachability) => {
-      clusterReachability.abort();
-    });
-  }
-
-  /**
-   * Helper function for calculating min/max/average values of latency
-   *
-   * @param {Array<any>} results
-   * @param {string} protocol
-   * @param {boolean} isVideoMesh
-   * @returns {{min:number, max: number, average: number}}
-   */
-  protected getStatistics(
-    results: Array<ClusterReachabilityResult & {isVideoMesh: boolean}>,
-    protocol: Protocol,
-    isVideoMesh: boolean
-  ) {
-    const values = results
-      .filter((result) => result.isVideoMesh === isVideoMesh)
-      .filter((result) => result[protocol].result === 'reachable')
-      .map((result) => result[protocol].latencyInMilliseconds);
-
-    if (values.length === 0) {
-      return {
-        min: -1,
-        max: -1,
-        average: -1,
-      };
-    }
-
-    return {
-      min: Math.min(...values),
-      max: Math.max(...values),
-      average: mean(values),
-    };
-  }
-
-  /**
-   * Sends a metric with all the statistics about how long reachability took
-   *
-   * @param {boolean} aborted true if the reachability checks were aborted
-   * @returns {void}
-   */
-  protected async sendMetric(aborted = false) {
-    const results = [];
-
-    Object.values(this.clusterReachability).forEach((clusterReachability) => {
-      results.push({
-        ...clusterReachability.getResult(),
-        isVideoMesh: clusterReachability.isVideoMesh,
-      });
-    });
-
-    const stats = {
-      aborted,
-      vmn: {
-        udp: this.getStatistics(results, 'udp', true),
-      },
-      public: {
-        udp: this.getStatistics(results, 'udp', false),
-        tcp: this.getStatistics(results, 'tcp', false),
-        xtls: this.getStatistics(results, 'xtls', false),
-      },
-      ipver: {
-        // @ts-ignore
-        firstIpV4: this.webex.internal.device.ipNetworkDetector.firstIpV4,
-        // @ts-ignore
-        firstIpV6: this.webex.internal.device.ipNetworkDetector.firstIpV6,
-        // @ts-ignore
-        firstMdns: this.webex.internal.device.ipNetworkDetector.firstMdns,
-        // @ts-ignore
-        totalTime: this.webex.internal.device.ipNetworkDetector.totalTime,
-      },
-      trigger: this.lastTrigger,
-    };
-    Metrics.sendBehavioralMetric(
-      BEHAVIORAL_METRICS.REACHABILITY_COMPLETED,
-      Metrics.prepareMetricFields(stats)
-    );
-  }
-
-  /**
-   * Starts all the timers used for various timeouts
-   *
-   * @returns {void}
-   */
-  private startTimers() {
-    this.vmnTimer = setTimeout(() => {
-      this.vmnTimer = undefined;
-      // if we are only missing VMN results, then we don't want to wait for them any longer
-      // as they are likely to fail if users are not on corporate network
-      if (this.areAllPublicClusterResultsReady()) {
-        LoggerProxy.logger.log(
-          'Reachability:index#startTimers --> Reachability checks timed out (VMN timeout)'
-        );
-
-        this.resolveReachabilityPromise();
-      }
-    }, VIDEO_MESH_TIMEOUT * 1000);
-
-    this.publicCloudTimer = setTimeout(() => {
-      this.publicCloudTimer = undefined;
-
-      LoggerProxy.logger.log(
-        `Reachability:index#startTimers --> Reachability checks timed out (${DEFAULT_TIMEOUT}s)`
-      );
-
-      // check against minimum required clusters, do a new call if we don't have enough
-
-      // resolve the promise, so that the client won't be blocked waiting on meetings.register() for too long
-      this.resolveReachabilityPromise();
-    }, DEFAULT_TIMEOUT * 1000);
-
-    this.overallTimer = setTimeout(() => {
-      this.overallTimer = undefined;
-      this.abortClusterReachability();
-      this.emit(
-        {
-          file: 'reachability',
-          function: 'overallTimer timeout',
-        },
-        'reachability:done',
-        {}
-      );
-      this.sendMetric();
-
-      LoggerProxy.logger.log(
-        `Reachability:index#startTimers --> Reachability checks fully timed out (${OVERALL_TIMEOUT}s)`
-      );
-    }, OVERALL_TIMEOUT * 1000);
-  }
-
-  /**
-   * Stores given reachability results in local storage
-   *
-   * @param {ReachabilityResults} results
-   * @returns {Promise<void>}
-   */
-  private async storeResults(results: ReachabilityResults) {
-    // @ts-ignore
-    await this.webex.boundedStorage.put(
-      this.namespace,
-      REACHABILITY.localStorageResult,
-      JSON.stringify(results)
-    );
-  }
-
-  /**
-   * Resets all the internal counters that keep track of the results
-   *
-   * @returns {void}
-   */
-  private resetResultCounters() {
-    this.expectedResultsCount.videoMesh.udp = 0;
-    this.expectedResultsCount.public.udp = 0;
-    this.expectedResultsCount.public.tcp = 0;
-    this.expectedResultsCount.public.xtls = 0;
-
-    this.resultsCount.videoMesh.udp = 0;
-    this.resultsCount.public.udp = 0;
-    this.resultsCount.public.tcp = 0;
-    this.resultsCount.public.xtls = 0;
-  }
-
-  /**
-   * Clears the timer
-   *
-   * @param {string} timer name of the timer to clear
-   * @returns {void}
-   */
-  private clearTimer(timer: string) {
-    if (this[timer]) {
-      clearTimeout(this[timer]);
-      this[timer] = undefined;
-    }
-  }
-
-  /**
-   * Aborts current checks that are in progress
-   *
-   * @returns {void}
-   */
-  private abortCurrentChecks() {
-    this.clearTimer('vmnTimer');
-    this.clearTimer('publicCloudTimer');
-    this.clearTimer('overallTimer');
-
-    this.abortClusterReachability();
-  }
-
-  /**
-   * Performs reachability checks for all clusters
-   * @param {ClusterList} clusterList
-   * @returns {Promise<void>} promise that's resolved as soon as the checks are started
-   */
-  private async performReachabilityChecks(clusterList: ClusterList) {
-    const results: ReachabilityResults = {};
-
-    this.clusterReachability = {};
-
-    this.startTime = performance.now();
-
-    const protocols = resolveReachabilityProtocols(
-      // @ts-ignore
-      this.webex.config.meetings.enableReachabilityChecks
-    );
-
-    const enabledProtocols = [
-      protocols.udp && 'UDP',
-      protocols.tcp && 'TCP',
-      protocols.tls && 'TLS',
-    ].filter(Boolean);
-
-    LoggerProxy.logger.log(
-      `Reachability:index#performReachabilityChecks --> doing ${enabledProtocols.join(
-        ','
-      )} reachability checks`
-    );
-
-    this.resetResultCounters();
-
-    // sanitize the urls in the clusterList
-    Object.keys(clusterList).forEach((key) => {
-      const cluster = clusterList[key];
-
-      // Linus doesn't support TCP reachability checks on video mesh nodes
-      const includeTcpReachability = protocols.tcp && !cluster.isVideoMesh;
-
-      if (!includeTcpReachability) {
-        cluster.tcp = [];
-      }
-
-      // Linus doesn't support xTLS reachability checks on video mesh nodes
-      const includeTlsReachability = protocols.tls && !cluster.isVideoMesh;
-
-      if (!includeTlsReachability) {
-        cluster.xtls = [];
-      }
-
-      // initialize the result for this cluster
-      results[key] = {
-        udp: {result: cluster.udp.length > 0 ? 'unreachable' : 'untested'},
-        tcp: {result: cluster.tcp.length > 0 ? 'unreachable' : 'untested'},
-        xtls: {result: cluster.xtls.length > 0 ? 'unreachable' : 'untested'},
-        isVideoMesh: cluster.isVideoMesh,
-      };
-
-      // update expected results counters to include this cluster
-      this.expectedResultsCount[cluster.isVideoMesh ? 'videoMesh' : 'public'].udp +=
-        cluster.udp.length > 0 ? 1 : 0;
-      if (!cluster.isVideoMesh) {
-        this.expectedResultsCount.public.tcp += cluster.tcp.length > 0 ? 1 : 0;
-        this.expectedResultsCount.public.xtls += cluster.xtls.length > 0 ? 1 : 0;
-      }
-    });
-
-    const isFirstResult = {
-      udp: true,
-      tcp: true,
-      xtls: true,
-    };
-
-    // save the initialized results (in case we don't get any "resultReady" events at all)
-    await this.storeResults(results);
-
-    if (!clusterList || !Object.keys(clusterList).length) {
-      // nothing to do, finish immediately
-      this.resolveReachabilityPromise(false);
-
-      this.emit(
-        {
-          file: 'reachability',
-          function: 'performReachabilityChecks',
-        },
-        'reachability:done',
-        {}
-      );
-
-      return;
-    }
-
-    this.startTimers();
-
-    // now start the reachability on all the clusters
-    Object.keys(clusterList).forEach((key) => {
-      const cluster = clusterList[key];
-
-      this.clusterReachability[key] = new ClusterReachability(
-        key,
-        cluster,
-        // @ts-ignore
-        this.webex.config.meetings.enablePerUdpUrlReachability
-      );
-      this.clusterReachability[key].on(Events.resultReady, async (data: ResultEventData) => {
-        const {protocol, result, clientMediaIPs, latencyInMilliseconds} = data;
-
-        if (isFirstResult[protocol]) {
-          this.emit(
-            {
-              file: 'reachability',
-              function: 'resultReady event handler',
-            },
-            'reachability:firstResultAvailable',
-            {
-              protocol,
-            }
-          );
-          isFirstResult[protocol] = false;
-        }
-        this.resultsCount[cluster.isVideoMesh ? 'videoMesh' : 'public'][protocol] += 1;
-
-        const areAllResultsReady = this.areAllResultsReady();
-
-        results[key][protocol].result = result;
-        results[key][protocol].clientMediaIPs = clientMediaIPs;
-        results[key][protocol].latencyInMilliseconds = latencyInMilliseconds;
-
-        await this.storeResults(results);
-
-        if (areAllResultsReady) {
-          this.clearTimer('overallTimer');
-          this.emit(
-            {
-              file: 'reachability',
-              function: 'performReachabilityChecks',
-            },
-            'reachability:done',
-            {}
-          );
-          this.sendMetric();
-
-          LoggerProxy.logger.log(
-            `Reachability:index#gatherReachability --> Reachability checks fully completed`
-          );
-          this.resolveReachabilityPromise();
-        }
-      });
-
-      // clientMediaIps can be updated independently from the results, so we need to listen for them too
-      this.clusterReachability[key].on(
-        Events.clientMediaIpsUpdated,
-        async (data: ClientMediaIpsUpdatedEventData) => {
-          results[key][data.protocol].clientMediaIPs = data.clientMediaIPs;
-
-          await this.storeResults(results);
-        }
-      );
-
-      this.clusterReachability[key].on(
-        Events.natTypeUpdated,
-        async (data: NatTypeUpdatedEventData) => {
-          this.natType = data.natType;
-        }
-      );
-
-      this.clusterReachability[key].start(); // not awaiting on purpose
-    });
-  }
-
-  /**
-   * Returns the clientMediaPreferences object that needs to be sent to the backend
-   * when joining a meeting
-   *
-   * @param {boolean} isMultistream
-   * @param {IP_VERSION} ipver
-   * @returns {Object}
-   */
-  async getClientMediaPreferences(
+  public async getClientMediaPreferences(
     isMultistream: boolean,
     ipver?: IP_VERSION
   ): Promise<ClientMediaPreferences> {
-    // if 0 or undefined, we assume version 0 and don't send any reachability in clientMediaPreferences
-    if (!this.orpheusApiVersion) {
-      return {
-        ipver,
-        joinCookie: await this.getJoinCookie(),
-        preferTranscoding: !isMultistream,
-      };
+    if (this.facade && isReachabilityEnabled(this.webex.config.meetings.enableReachabilityChecks)) {
+      const preferences = await this.facade.getClientMediaPreferences(isMultistream, ipver);
+      await this.storePreferences(preferences);
     }
-
-    // must be version 1
-
-    // for version 1, the reachability report goes into clientMediaPreferences (and it contains joinCookie)
-    const reachabilityReport = (await this.getReachabilityReport()) as {
-      joinCookie: any;
-      reachability?: ReachabilityReportV1;
-    };
+    if (!this.orpheusApiVersion)
+      return {ipver, preferTranscoding: !isMultistream, joinCookie: await this.getJoinCookie()};
 
     return {
       ipver,
       preferTranscoding: !isMultistream,
-      ...reachabilityReport,
-    };
+      ...(await this.getReachabilityReport()),
+    } as ClientMediaPreferences;
   }
 
   /**
-   * Returns the reachability report that needs to be attached to the ROAP messages
-   * that we send to the backend.
-   * It may return undefined, if reachability is not needed to be attached to ROAP messages (that's the case for v1 or Orpheus API)
-   *
-   * @returns {Promise<ReachabilityReportV0>} object that needs to be attached to Roap messages
+   * Attach reachability to ROAP only for version-zero discovery.
+   * @returns {Promise<Object>} Version-zero report or undefined.
    */
-  async getReachabilityReportToAttachToRoap(): Promise<ReachabilityReportV0 | undefined> {
-    // version 0
-    if (!this.orpheusApiVersion) {
-      return this.getReachabilityResults();
+  public async getReachabilityReportToAttachToRoap(): Promise<ReachabilityReportV0 | undefined> {
+    return this.orpheusApiVersion ? undefined : this.getReachabilityResults();
+  }
+
+  /**
+   * Check successful SDK probes for a selected subnet.
+   * @param {*} subnet - Selected server's first IPv4 octet.
+   * @returns {boolean} Whether a matching endpoint was reached.
+   */
+  public isSubnetReachable(subnet: string): boolean | null {
+    return this.facade?.isSubnetReachable(subnet) ?? false;
+  }
+
+  /**
+   * Check public UDP/TCP success, excluding video-mesh-only results.
+   * @returns {Promise<boolean>} Whether any public cluster is reachable.
+   */
+  public async isAnyPublicClusterReachable(): Promise<boolean> {
+    return Object.values(await this.readResults()).some(
+      (cluster) =>
+        !cluster.isVideoMesh &&
+        (cluster.udp?.result === 'reachable' || cluster.tcp?.result === 'reachable')
+    );
+  }
+
+  /**
+   * Check measured success for the requested transport.
+   * @param {*} protocol - UDP, TCP or xTLS transport.
+   * @returns {Promise<boolean>} Whether any cluster was reached using the transport.
+   */
+  public async isAnyClusterReachableViaProtocol(protocol: Protocol): Promise<boolean> {
+    return Object.values(await this.readResults()).some(
+      (cluster) => cluster[protocol]?.result === 'reachable'
+    );
+  }
+
+  /**
+   * Report a fully unreachable backend only when every transport was tested.
+   * @returns {Promise<boolean>} Whether every tested transport failed.
+   */
+  public async isWebexMediaBackendUnreachable(): Promise<boolean> {
+    const results = Object.values(await this.readResults());
+
+    return protocols.every(
+      (protocol) =>
+        results.some((cluster) =>
+          ['reachable', 'unreachable'].includes(cluster[protocol]?.result)
+        ) && results.every((cluster) => cluster[protocol]?.result !== 'reachable')
+    );
+  }
+
+  /**
+   * Preserve public/video-mesh outcome counts and the NAT-type metric.
+   * @returns {Promise<Object>} Existing metric fields.
+   */
+  public async getReachabilityMetrics(): Promise<ReachabilityMetrics> {
+    const metrics = {natType: this.natType} as ReachabilityMetrics;
+    for (const clusterType of ['public', 'vmn']) {
+      for (const protocol of protocols) {
+        metrics[`reachability_${clusterType}_${protocol}_success`] = 0;
+        metrics[`reachability_${clusterType}_${protocol}_failed`] = 0;
+      }
+    }
+    for (const cluster of Object.values(await this.readResults())) {
+      for (const protocol of protocols) {
+        if (cluster[protocol] && cluster[protocol].result !== 'untested') {
+          const outcome = cluster[protocol].result === 'reachable' ? 'success' : 'failed';
+          metrics[
+            `reachability_${cluster.isVideoMesh ? 'vmn' : 'public'}_${protocol}_${outcome}`
+          ] += 1;
+        }
+      }
     }
 
-    // version 1
+    return metrics;
+  }
 
-    // for version 1 we don't attach anything to Roap messages, reachability report is sent inside clientMediaPreferences
-    return undefined;
+  /**
+   * Publish the existing completion statistics without sensitive discovery data.
+   * @param {*} aborted - Whether the run was stopped.
+   * @returns {Promise<void>} Metric submission attempt.
+   */
+  protected async sendMetric(aborted = false): Promise<void> {
+    try {
+      const results = Object.values(await this.readResults());
+      const statistics = (protocol: Protocol, isVideoMesh: boolean) => {
+        const values = results
+          .filter(
+            (result) =>
+              !!result.isVideoMesh === isVideoMesh && result[protocol]?.result === 'reachable'
+          )
+          .map((result) => result[protocol].latencyInMilliseconds)
+          .filter(Number.isFinite);
+
+        return values.length
+          ? {
+              min: Math.min(...values),
+              max: Math.max(...values),
+              average: values.reduce((a, b) => a + b, 0) / values.length,
+            }
+          : {min: -1, max: -1, average: -1};
+      };
+      const detector = this.webex.internal.device?.ipNetworkDetector;
+      Metrics.sendBehavioralMetric(
+        BEHAVIORAL_METRICS.REACHABILITY_COMPLETED,
+        Metrics.prepareMetricFields({
+          aborted,
+          vmn: {udp: statistics('udp', true)},
+          public: {
+            udp: statistics('udp', false),
+            tcp: statistics('tcp', false),
+            xtls: statistics('xtls', false),
+          },
+          ipver: {
+            firstIpV4: detector?.firstIpV4,
+            firstIpV6: detector?.firstIpV6,
+            firstMdns: detector?.firstMdns,
+            totalTime: detector?.totalTime,
+          },
+          trigger: this.lastTrigger,
+        })
+      );
+    } catch {
+      LoggerProxy.logger.warn('Reachability: unable to record completion metric');
+    }
   }
 }

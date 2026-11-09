@@ -1180,6 +1180,8 @@ export default class Meetings extends WebexPlugin {
       return this.unregistrationPromise;
     }
 
+    this.reachability.stopReachability();
+
     if (this.registrationPromise) {
       LoggerProxy.logger.info(
         'Meetings:index#unregister --> INFO, Meetings plugin registration in progress, waiting to unregister'

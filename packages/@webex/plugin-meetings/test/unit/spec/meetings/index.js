@@ -829,6 +829,14 @@ describe('plugin-meetings', () => {
       });
 
       describe('#unregister', () => {
+        it('stops reachability and scheduled refresh before deregistering', async () => {
+          const stop = sinon.stub(webex.meetings.reachability, 'stopReachability');
+
+          await webex.meetings.unregister();
+
+          assert.calledOnceWithExactly(stop);
+        });
+
         it('emits an event and resolves when unregister succeeds', (done) => {
           webex.meetings.registered = true;
           webex.meetings.unregister().then(() => {

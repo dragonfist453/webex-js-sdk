@@ -100,7 +100,11 @@ describe('Orpheus-backed Meetings reachability', () => {
       gatherReachability = sinon.stub().callsFake(async () => {
         await options.fetchImpl('https://app.example.test/calliope/api/discovery/v1/clusters', {
           method: 'POST',
-          body: JSON.stringify({'supported-options': {'report-version': 1}, trigger: 'startup'}),
+          body: JSON.stringify({
+            ipver: options.getIpVersion(),
+            'supported-options': {'report-version': 1},
+            trigger: 'startup',
+          }),
         });
       });
       getClientMediaPreferences = sinon.stub().callsFake(async (isMultistream, ipver) => ({
@@ -134,6 +138,108 @@ describe('Orpheus-backed Meetings reachability', () => {
       implementation: 'OrpheusReachability',
       ready: false,
     });
+  });
+
+  [
+    {name: 'dual-stack', ipv4: true, ipv6: true, ipver: 1},
+    {name: 'IPv4', ipv4: true, ipv6: false, ipver: 4},
+    {name: 'IPv6', ipv4: false, ipv6: true, ipver: 6},
+  ].forEach(({name, ipv4, ipv6, ipver}) => {
+    it(`preserves detected ${name} in discovery across repeated gathers`, async () => {
+      (MeetingUtil.getIpVersion as any).restore();
+      webex.config.meetings.backendIpv6NativeSupport = true;
+      const detector = webex.internal.device.ipNetworkDetector;
+      detector.supportsIpV4 = ipv4;
+      detector.supportsIpV6 = ipv6;
+      detector.detect.callsFake((force = false) => {
+        if (force) {
+          detector.supportsIpV4 = undefined;
+          detector.supportsIpV6 = undefined;
+        }
+        return Promise.resolve();
+      });
+
+      for (const trigger of ['registration', 're-registration', 'manual']) {
+        await reachability.gatherReachability(trigger);
+        assert.equal(webex.request.lastCall.args[0].body.ipver, ipver);
+        reachability.stopReachability();
+      }
+    });
+  });
+
+  it('waits for cold IP-family detection before starting discovery', async () => {
+    (MeetingUtil.getIpVersion as any).restore();
+    webex.config.meetings.backendIpv6NativeSupport = true;
+    const detector = webex.internal.device.ipNetworkDetector;
+    let finishDetection;
+    detector.detect.callsFake(
+      () =>
+        new Promise((resolve) => {
+          finishDetection = resolve;
+        })
+    );
+    const pending = reachability.gatherReachability('registration');
+    await Promise.resolve();
+    assert.notCalled(loader);
+    assert.notCalled(webex.request);
+    detector.supportsIpV4 = true;
+    detector.supportsIpV6 = true;
+    finishDetection();
+    await pending;
+    assert.calledOnceWithExactly(detector.detect, false);
+    assert.equal(webex.request.lastCall.args[0].body.ipver, 1);
+  });
+
+  it('waits for an already-running detector rather than treating its early return as ready', async () => {
+    (MeetingUtil.getIpVersion as any).restore();
+    webex.config.meetings.backendIpv6NativeSupport = true;
+    const detector = Object.assign(new EventEmitter(), {
+      state: 'in-progress',
+      supportsIpV4: undefined as boolean | undefined,
+      supportsIpV6: undefined as boolean | undefined,
+      detect: sinon.stub().resolves(),
+    });
+    webex.internal.device.ipNetworkDetector = detector;
+    const pending = reachability.gatherReachability('registration');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.notCalled(webex.request);
+    detector.supportsIpV4 = true;
+    detector.state = 'idle';
+    detector.emit('change:state');
+    await pending;
+    assert.equal(webex.request.lastCall.args[0].body.ipver, 4);
+    assert.equal(detector.listenerCount('change:state'), 0);
+  });
+
+  it('bounds unknown IP detection without blocking readiness or fabricating a family', async () => {
+    const clock = sinon.useFakeTimers();
+    (MeetingUtil.getIpVersion as any).returns(0);
+    webex.internal.device.ipNetworkDetector.detect.returns(new Promise(() => {}));
+    const pending = reachability.gatherReachability('registration');
+    await clock.tickAsync(2999);
+    assert.notCalled(loader);
+    await clock.tickAsync(1);
+    await pending;
+    assert.equal(webex.request.lastCall.args[0].body.ipver, 0);
+  });
+
+  it('stops an IP-detection wait without starting retired browser work', async () => {
+    (MeetingUtil.getIpVersion as any).returns(0);
+    let finishDetection;
+    webex.internal.device.ipNetworkDetector.detect.callsFake(
+      () =>
+        new Promise((resolve) => {
+          finishDetection = resolve;
+        })
+    );
+    const pending = reachability.gatherReachability('registration');
+    await Promise.resolve();
+    reachability.stopReachability();
+    await pending;
+    finishDetection();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.notCalled(loader);
+    assert.notCalled(webex.request);
   });
 
   it('delegates discovery and gathering to Orpheus and stores all 22 clusters before completion', async () => {

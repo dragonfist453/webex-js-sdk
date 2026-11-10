@@ -61,6 +61,7 @@ Existing protocol/NAT/report types and URL utilities remain. The old per-UDP-URL
 - `reachability:stopped` is emitted for an active gather stopped by the consumer.
 - Stop/disposal retire the local generation, settle callers and suppress late completion.
 - Live reports/cookies take precedence over optional persisted cache data. Cache failures do not discard measured results.
+- Reuse meaningful device IP-family detection without forcing its cached results back to unknown while Orpheus builds discovery context. The existing `MeetingUtil.getIpVersion` mapping remains authoritative.
 
 ## ADDED Requirements
 

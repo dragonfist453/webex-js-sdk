@@ -50,6 +50,7 @@ export default class Reachability extends EventsScope {
   private waiting?: Promise<ReachabilityResults>;
   private settleWaiting?: (value?: ReachabilityResults) => void;
   private readinessTimer?: ReturnType<typeof setTimeout>;
+  private cancelIpDetectionWait?: () => void;
   private generation = 0;
   private closed = false;
   private hybridClusters = new Set<string>();
@@ -245,8 +246,10 @@ export default class Reachability extends EventsScope {
    */
   private async gather(trigger: string, generation: number): Promise<ReachabilityResults> {
     try {
-      const detector = this.webex.internal.device?.ipNetworkDetector;
-      Promise.resolve(detector?.detect(true)).catch(() => {});
+      if (MeetingUtil.getIpVersion(this.webex) === IP_VERSION.unknown) {
+        await this.prepareIpDetection();
+        if (generation !== this.generation) return undefined;
+      }
       const facade = await this.getFacade();
       if (generation !== this.generation) return undefined;
       await facade.gatherReachability(trigger);
@@ -268,6 +271,37 @@ export default class Reachability extends EventsScope {
 
       return {};
     }
+  }
+
+  /**
+   * Wait briefly for unknown IP-family detection without clearing meaningful cached results.
+   * @returns {Promise<void>} Detection completion or the bounded fallback.
+   */
+  private async prepareIpDetection(): Promise<void> {
+    const detector = this.webex.internal.device?.ipNetworkDetector;
+    if (!detector?.detect) return;
+    await new Promise<void>((resolve) => {
+      let finished = false;
+      let timer: ReturnType<typeof setTimeout>;
+      let check: () => void;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        detector.off?.('change:state', check);
+        if (this.cancelIpDetectionWait === finish) this.cancelIpDetectionWait = undefined;
+        resolve();
+      };
+      check = () => {
+        if (detector.state !== 'in-progress') finish();
+      };
+      timer = setTimeout(finish, READINESS_TIMEOUT_MS);
+      this.cancelIpDetectionWait = finish;
+      detector.on?.('change:state', check);
+      Promise.resolve()
+        .then(() => detector.detect(false))
+        .then(check, finish);
+    });
   }
 
   /**
@@ -314,6 +348,7 @@ export default class Reachability extends EventsScope {
    * @returns {void}
    */
   public stopReachability(): void {
+    this.cancelIpDetectionWait?.();
     const active = !!this.run;
     this.generation += 1;
     this.run = undefined;

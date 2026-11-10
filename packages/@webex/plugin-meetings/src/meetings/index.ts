@@ -1094,13 +1094,6 @@ export default class Meetings extends WebexPlugin {
       this.executeRegistrationStep(() => this.getGeoHint(), 'getGeoHint'),
       this.executeRegistrationStep(
         () =>
-          this.startReachability('registration').catch((error) => {
-            LoggerProxy.logger.warn(`Meetings:index#register --> startReachability failed:`, error);
-          }),
-        'startReachability'
-      ),
-      this.executeRegistrationStep(
-        () =>
           // @ts-ignore
           this.webex.internal.device
             .register(deviceRegistrationOptions)
@@ -1124,6 +1117,21 @@ export default class Meetings extends WebexPlugin {
         'checkH264Support'
       ),
     ])
+      .then(() => {
+        if (this.unregistrationPromise) return undefined;
+
+        // Device/Mercury callbacks can render synchronously; start the probe budget afterward.
+        return this.executeRegistrationStep(
+          () =>
+            this.startReachability('registration').catch((error) => {
+              LoggerProxy.logger.warn(
+                `Meetings:index#register --> startReachability failed:`,
+                error
+              );
+            }),
+          'startReachability'
+        );
+      })
       .then(() => {
         this.listenForEvents();
         Trigger.trigger(

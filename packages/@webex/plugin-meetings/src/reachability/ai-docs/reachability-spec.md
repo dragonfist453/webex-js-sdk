@@ -62,6 +62,7 @@ Existing protocol/NAT/report types and URL utilities remain. The old per-UDP-URL
 - Stop/disposal retire the local generation, settle callers and suppress late completion.
 - Live reports/cookies take precedence over optional persisted cache data. Cache failures do not discard measured results.
 - Reuse meaningful device IP-family detection without forcing its cached results back to unknown while Orpheus builds discovery context. The existing `MeetingUtil.getIpVersion` mapping remains authoritative.
+- Meetings registration starts collection after device/Mercury callbacks settle so their synchronous UI work does not consume the probe budget. The readiness wait remains bounded; pending unregistration suppresses the deferred collection.
 
 ## ADDED Requirements
 

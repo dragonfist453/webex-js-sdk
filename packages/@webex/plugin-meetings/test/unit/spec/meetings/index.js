@@ -454,6 +454,93 @@ describe('plugin-meetings', () => {
 
     describe('Public API Contracts', () => {
       describe('#register', () => {
+        it('starts reachability after device registration and Mercury callbacks settle', async () => {
+          webex.canAuthorize = true;
+          let finishDevice;
+          let finishMercury;
+          webex.internal.device.register.returns(
+            new Promise((resolve) => {
+              finishDevice = resolve;
+            })
+          );
+          webex.internal.mercury.connect.returns(
+            new Promise((resolve) => {
+              finishMercury = resolve;
+            })
+          );
+
+          const registration = webex.meetings.register();
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.notCalled(startReachabilityStub);
+          finishDevice();
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.calledOnce(webex.internal.mercury.connect);
+          assert.notCalled(startReachabilityStub);
+          finishMercury();
+          await registration;
+          assert.calledOnceWithExactly(startReachabilityStub, 'registration');
+          assert.callOrder(
+            webex.internal.device.register,
+            webex.internal.mercury.connect,
+            startReachabilityStub
+          );
+        });
+
+        ['device', 'mercury'].forEach((phase) => {
+          it(`does not start deferred reachability after unregister during ${phase} setup`, async () => {
+            webex.canAuthorize = true;
+            let finishSetup;
+            const pendingSetup = new Promise((resolve) => {
+              finishSetup = resolve;
+            });
+            const setup =
+              phase === 'device' ? webex.internal.device.register : webex.internal.mercury.connect;
+            setup.returns(pendingSetup);
+            const registration = webex.meetings.register();
+            await new Promise((resolve) => setImmediate(resolve));
+            const unregistration = webex.meetings.unregister();
+            finishSetup();
+            await Promise.all([registration, unregistration]);
+            assert.notCalled(startReachabilityStub);
+            assert.isFalse(webex.meetings.registered);
+          });
+        });
+
+        it('does not start deferred reachability if an independent registration step fails', async () => {
+          webex.canAuthorize = true;
+          let finishDevice;
+          webex.internal.device.register.returns(new Promise((resolve) => {
+            finishDevice = resolve;
+          }));
+          sinon.stub(webex.meetings, 'getGeoHint').rejects(new Error('geo unavailable'));
+          await assert.isRejected(webex.meetings.register(), 'geo unavailable');
+          finishDevice();
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.notCalled(startReachabilityStub);
+          assert.isFalse(webex.meetings.registered);
+        });
+
+        ['geo', 'h264'].forEach((phase) => {
+          it(`waits for ${phase} setup before starting reachability`, async () => {
+            webex.canAuthorize = true;
+            let finishSetup;
+            const setup = phase === 'geo'
+              ? sinon.stub(webex.meetings, 'getGeoHint')
+              : MeetingsUtil.checkH264Support;
+            setup.returns(new Promise((resolve) => {
+              finishSetup = resolve;
+            }));
+            const registration = webex.meetings.register();
+            await new Promise((resolve) => setImmediate(resolve));
+            assert.calledOnce(webex.internal.device.register);
+            assert.calledOnce(webex.internal.mercury.connect);
+            assert.notCalled(startReachabilityStub);
+            finishSetup();
+            await registration;
+            assert.calledOnceWithExactly(startReachabilityStub, 'registration');
+          });
+        });
+
         it('emits an event and resolves when register succeeds', async () => {
           webex.canAuthorize = true;
           await webex.meetings.register();
@@ -566,8 +653,7 @@ describe('plugin-meetings', () => {
             includeDetails: CatalogDetails.features,
           });
 
-          await clock.tick(1000);
-          await webex.meetings.fetchUserPreferredWebexSite;
+          await clock.tickAsync(1000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: false,
@@ -577,8 +663,7 @@ describe('plugin-meetings', () => {
             checkH264Support: false,
           });
 
-          await clock.tick(1000);
-          await MeetingsUtil.checkH264Support;
+          await clock.tickAsync(1000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: false,
@@ -588,51 +673,49 @@ describe('plugin-meetings', () => {
             checkH264Support: true,
           });
 
-          await clock.tick(1000);
-          await webex.meetings.startReachability;
+          await clock.tickAsync(1000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: false,
-            startReachability: true,
+            startReachability: false,
             deviceRegister: false,
             mercuryConnect: false,
             checkH264Support: true,
           });
 
-          await clock.tick(1000);
-          await webex.internal.device.register;
+          await clock.tickAsync(1000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: false,
-            startReachability: true,
+            startReachability: false,
             deviceRegister: true,
             mercuryConnect: false,
             checkH264Support: true,
           });
 
-          await clock.tick(1000);
-          await webex.meetings.getGeoHint;
+          await clock.tickAsync(1000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: true,
-            startReachability: true,
+            startReachability: false,
             deviceRegister: true,
             mercuryConnect: false,
             checkH264Support: true,
           });
 
-          await clock.tick(6000);
-          await webex.internal.mercury.connect;
+          await clock.tickAsync(6000);
           assert.deepEqual(webex.meetings.registrationStatus, {
             fetchWebexSite: true,
             getGeoHint: true,
-            startReachability: true,
+            startReachability: false,
             deviceRegister: true,
             mercuryConnect: true,
             checkH264Support: true,
           });
 
+          await clock.tickAsync(2000);
           await registerPromise;
+          assert.isTrue(webex.meetings.registrationStatus.startReachability);
 
           clock.restore();
         });
@@ -829,6 +912,14 @@ describe('plugin-meetings', () => {
       });
 
       describe('#unregister', () => {
+        it('stops reachability and scheduled refresh before deregistering', async () => {
+          const stop = sinon.stub(webex.meetings.reachability, 'stopReachability');
+
+          await webex.meetings.unregister();
+
+          assert.calledOnceWithExactly(stop);
+        });
+
         it('emits an event and resolves when unregister succeeds', (done) => {
           webex.meetings.registered = true;
           webex.meetings.unregister().then(() => {

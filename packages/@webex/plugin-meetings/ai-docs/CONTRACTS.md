@@ -245,6 +245,7 @@ The package exposes no server endpoint or CLI of its own. It calls Webex service
 | Webex Locus and meeting services | state, discovery, lifecycle, controls | owning request classes/specs | network service may fail or reject | preserve current projection; bounded retry only where implemented | service-discovered contract |
 | browser media and media libraries | WebRTC, streams, media-core negotiation | `src/media/`, `src/roap/`, `src/multistream/` | browser capability/permission dependent | media error and bounded recovery/rejoin | `@webex/internal-media-core` at the exact version pinned in `package.json` |
 | workspace feature packages | identity, people/rooms, support, Voicea/LLM and helpers | `package.json` | resolved by Yarn workspace | caller-visible capability absence/error | `workspace:*` |
+| Orpheus reachability runtime | discovery/probe lifecycle, aggregation and media preferences | `src/reachability/ai-docs/reachability-spec.md`, `scripts/orpheus-reachability-source.json` | pinned source is built and staged into the plugin package; browser capabilities are required only at use time | disabled rejects, unsupported/caught gather failure returns empty object; no legacy probe fallback | exact reviewed source revision in manifest |
 
 ## Compatibility & Deprecation Policy
 
